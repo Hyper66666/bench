@@ -1,38 +1,62 @@
-﻿# Benchmarks
+﻿# Sengoo Bench
 
-This directory stores Sengoo performance suites and benchmark outputs.
+Independent benchmark/test repository for Sengoo.
 
-- `suites/runtime/`: runtime-oriented benchmark cases
-- `suites/compile/`: full compile benchmark cases
-- `suites/incremental/`: incremental compile benchmark cases
-- `tests/`: smoke/e2e test inputs
-- `scripts/`: perf gate and smoke scripts
-- `baseline.json`: baseline and KPI target metadata
-- `results/`: machine-readable benchmark run results
+Goal: keep performance tracking and test assets evolving independently from compiler core code.
 
-Use `sgc bench run|compile|incremental <suite>` to execute benchmark suites.
+## What You Get
 
-## Run Scripts
+- Runtime / full compile / incremental compile benchmark suites
+- Perf gate scripts (soft/hard mode)
+- E2E smoke scripts
+- Cross-language benchmark harness (Sengoo vs C++/Rust/Python)
+
+## Layout
+
+- `suites/runtime/`
+- `suites/compile/`
+- `suites/incremental/`
+- `tests/`
+- `scripts/`
+- `baseline.json`
+- `results/`
+
+## Requirements
+
+- Rust toolchain (to build and run `sgc`)
+- Python 3
+- LLVM/Clang (for native backend paths)
+- Sengoo main repository path available via `SENGOO_ROOT`
+
+## Quick Usage
 
 ```bash
-bash ./bench/scripts/perf-gate.sh --mode soft --sample ./bench/sample-regression.json
-bash ./bench/scripts/e2e-smoke.sh
+# run soft perf gate
+bash ./scripts/perf-gate.sh --mode soft --sample ./sample-regression.json
+
+# run smoke
+bash ./scripts/e2e-smoke.sh
+
+# run cross-language comparison
+python ./cross_lang_bench.py
 ```
 
 ```powershell
-powershell -File .\\bench\\scripts\\perf-gate.ps1 -Mode soft -Sample .\\bench\\sample-regression.json
-powershell -File .\\bench\\scripts\\e2e-smoke.ps1
+powershell -File .\scripts\perf-gate.ps1 -Mode soft -Sample .\sample-regression.json
+powershell -File .\scripts\e2e-smoke.ps1
+python .\cross_lang_bench.py
 ```
 
-## Publish As Separate Repository
+## SENGOO_ROOT
 
-`bench/` is self-contained and can be pushed as an independent GitHub repo.
+When this repository is not located inside Sengoo source tree, set:
 
-1. `cd bench`
-2. `git init`
-3. `git add .`
-4. `git commit -m "bench: initial import"`
-5. `git remote add origin <your-bench-repo-url>`
-6. `git push -u origin main`
+```bash
+export SENGOO_ROOT=/path/to/Sengoo
+```
 
-If Sengoo source is in another directory, set `SENGOO_ROOT` before running `scripts/e2e-smoke.*` or `cross_lang_bench.py`.
+```powershell
+$env:SENGOO_ROOT = "C:\path\to\Sengoo"
+```
+
+Then run scripts from this repository root.

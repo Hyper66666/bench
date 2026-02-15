@@ -2,6 +2,7 @@
 results/*.json
 .cross-lang-work/
 .scenario-matrix-work/
+.advanced-work/
 results/.tmp/
 
 # Generated suite artifacts

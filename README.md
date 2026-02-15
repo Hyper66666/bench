@@ -42,6 +42,10 @@ python ./cross_lang_bench.py
 
 # run general scenario matrix (5 scenarios x 4 languages)
 python ./scenario_matrix_bench.py
+
+# run advanced pipeline benchmark
+# (real incremental edits + 1k/10k/100k scale curve + fairness knobs + link share)
+python ./advanced_pipeline_bench.py
 ```
 
 ```powershell
@@ -49,9 +53,40 @@ powershell -File .\scripts\perf-gate.ps1 -Mode soft -Sample .\sample-regression.
 powershell -File .\scripts\e2e-smoke.ps1
 python .\cross_lang_bench.py
 python .\scenario_matrix_bench.py
+python .\advanced_pipeline_bench.py
 ```
 
 ## Latest Bench Reports (4 Languages)
+
+### Advanced Pipeline (Real Incremental + Scale Curve + E2E Link)
+
+Report:
+
+- `results/1771186949691-advanced-pipeline.json`
+
+Real incremental scenarios (`Before -> After`, ms):
+
+| Scenario | Sengoo | C++ (PCH) | Rust (cargo incremental) | Python |
+|---|---:|---:|---:|---:|
+| loop_body_change | 852.94 -> 829.16 | 1332.50 -> 1164.28 | 1092.74 -> 1214.62 | 77.29 -> 66.95 |
+| function_signature_change | 784.38 -> 830.71 | 1339.93 -> 1350.67 | 1091.84 -> 1208.16 | 76.44 -> 73.31 |
+| add_new_function | 825.02 -> 832.47 | 1350.65 -> 1173.37 | 1136.12 -> 1237.85 | 74.40 -> 72.90 |
+
+Scale curve: e2e build time (includes link where applicable):
+
+| LOC | Sengoo (ms) | C++ (ms) | Rust (ms) | Python (ms) |
+|---:|---:|---:|---:|---:|
+| 1000 | 851.70 | 1248.02 | 1203.30 | 91.11 |
+| 10000 | 1295.68 | 1235.39 | 1659.40 | 131.06 |
+| 100000 | 5415.02 | 1634.10 | 6265.71 | 792.75 |
+
+Link share:
+
+| LOC | Sengoo link share (%) | C++ link share (%) |
+|---:|---:|---:|
+| 1000 | 83.37 | 61.24 |
+| 10000 | 53.87 | 61.15 |
+| 100000 | 13.76 | 47.04 |
 
 ### Legacy Cross-Language Suite
 

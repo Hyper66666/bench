@@ -1,6 +1,7 @@
 # Generated benchmark outputs
 results/*.json
 .cross-lang-work/
+.scenario-matrix-work/
 results/.tmp/
 
 # Generated suite artifacts

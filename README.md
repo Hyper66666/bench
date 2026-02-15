@@ -51,56 +51,74 @@ python .\cross_lang_bench.py
 python .\scenario_matrix_bench.py
 ```
 
-## Latest Scenario Matrix (4 Languages)
+## Latest Bench Reports (4 Languages)
+
+### Legacy Cross-Language Suite
 
 Report:
 
-- `results/1771184915736-scenario-matrix.json`
+- `results/1771185060774-cross-language.json`
 
 Overall comparison table:
 
 | Metric | Sengoo | C++ | Rust | Python |
 |---|---:|---:|---:|---:|
-| Runtime p50 avg (ms) | 9.07 | 9.62 | 8.57 | 47.04 |
-| Full compile avg (ms) | 837.55 | 1716.57 | 1013.27 | 72.98 |
-| Incremental before avg (ms) | 807.92 | 1692.82 | 1022.63 | 66.66 |
-| Incremental after avg (ms) | 27.14 | 1674.30 | 1068.02 | 66.04 |
-| Incremental reduction avg (%) | 96.64 | 1.08 | -4.52 | 0.92 |
+| Runtime p50 (ms) | 10.20 | 13.97 | 14.10 | 37.84 |
+| Full compile avg (ms) | 862.21 | 1467.46 | 981.09 | 71.65 |
+| Incremental before avg (ms) | 836.59 | 1798.03 | 1022.70 | 77.16 |
+| Incremental after avg (ms) | 50.60 | 1740.37 | 1147.47 | 68.99 |
+| Incremental reduction (%) | 93.95 | 3.21 | -12.20 | 10.59 |
+
+### Scenario Matrix (5 Scenarios)
+
+Report:
+
+- `results/1771185238357-scenario-matrix.json`
+
+Overall comparison table:
+
+| Metric | Sengoo | C++ | Rust | Python |
+|---|---:|---:|---:|---:|
+| Runtime p50 avg (ms) | 8.92 | 8.55 | 8.59 | 45.14 |
+| Full compile avg (ms) | 835.92 | 1669.41 | 972.98 | 67.48 |
+| Incremental before avg (ms) | 841.96 | 1664.64 | 1039.68 | 67.25 |
+| Incremental after avg (ms) | 33.71 | 1702.23 | 1088.19 | 65.52 |
+| Incremental reduction avg (%) | 95.99 | -2.28 | -4.95 | 2.61 |
 
 Scenario-level runtime p50 (ms):
 
 | Scenario | Sengoo | C++ | Rust | Python |
 |---|---:|---:|---:|---:|
-| arith_loop | 7.89 | 8.35 | 8.41 | 45.16 |
-| branch_mix | 7.88 | 8.25 | 8.41 | 50.66 |
-| fn_call_hot | 7.39 | 7.95 | 8.20 | 46.42 |
-| array_index | 7.76 | 9.08 | 9.51 | 50.13 |
-| nested_loop | 14.42 | 14.46 | 8.30 | 42.86 |
+| arith_loop | 12.56 | 8.65 | 8.38 | 44.36 |
+| branch_mix | 7.79 | 8.75 | 8.76 | 46.28 |
+| fn_call_hot | 7.71 | 8.13 | 7.87 | 45.04 |
+| array_index | 7.88 | 8.17 | 8.15 | 47.55 |
+| nested_loop | 8.67 | 9.04 | 9.78 | 42.49 |
 
 Scenario-level full compile avg (ms):
 
 | Scenario | Sengoo | C++ | Rust | Python |
 |---|---:|---:|---:|---:|
-| arith_loop | 834.56 | 1703.47 | 1047.70 | 73.29 |
-| branch_mix | 827.62 | 1808.28 | 1034.57 | 71.98 |
-| fn_call_hot | 855.02 | 1684.48 | 992.27 | 71.08 |
-| array_index | 825.41 | 1664.79 | 1002.01 | 70.84 |
-| nested_loop | 845.13 | 1721.85 | 989.78 | 77.70 |
+| arith_loop | 846.67 | 1689.62 | 1008.01 | 67.38 |
+| branch_mix | 828.09 | 1662.31 | 960.43 | 62.47 |
+| fn_call_hot | 827.49 | 1647.67 | 969.11 | 72.84 |
+| array_index | 845.99 | 1674.86 | 949.25 | 65.60 |
+| nested_loop | 831.39 | 1672.59 | 978.11 | 69.11 |
 
 Scenario-level incremental reduction (%):
 
 | Scenario | Sengoo | C++ | Rust | Python |
 |---|---:|---:|---:|---:|
-| arith_loop | 96.62 | -1.58 | -2.26 | 2.04 |
-| branch_mix | 96.55 | 1.94 | -9.28 | -0.86 |
-| fn_call_hot | 96.57 | 2.02 | -6.55 | 3.33 |
-| array_index | 96.67 | 2.37 | -0.62 | -3.60 |
-| nested_loop | 96.81 | 0.63 | -3.87 | 3.71 |
+| arith_loop | 96.52 | -3.56 | -9.27 | 7.61 |
+| branch_mix | 94.39 | -2.72 | -12.92 | 0.36 |
+| fn_call_hot | 96.61 | -2.17 | -4.22 | 2.90 |
+| array_index | 96.22 | 0.64 | 0.79 | -3.47 |
+| nested_loop | 96.22 | -3.59 | 0.86 | 5.64 |
 
 Notes:
 
 - Runtime numbers are execution-only (compile excluded).
-- Incremental compile currently uses comment-only mutation for the second build.
+- Incremental compile uses comment-only mutation for the second build.
 - Python compile numbers are bytecode compile path (`py_compile`), not native binary compile.
 
 ## SENGOO_ROOT

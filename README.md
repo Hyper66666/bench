@@ -11,6 +11,7 @@ This repo is designed for one purpose: **measure performance and correctness tre
 - Scale curve (1k / 10k / 100k LOC)
 - Link-share and phase split analysis
 - Python interoperability benchmark (Sengoo Runtime / Rust PyO3 / C++ CPython API / Python native)
+- Non-invasive reflection benchmark (disabled vs enabled-unused vs enabled-used)
 - Bootstrap generality proof (multi-capability correctness + latency)
 - CI gate scripts (soft/hard) for KPI enforcement
 - E2E smoke scripts for baseline toolchain health
@@ -27,6 +28,7 @@ bench/
 |-- advanced_pipeline_bench.py
 |-- scenario_matrix_bench.py
 |-- python_interop_bench.py
+|-- noninvasive_reflection_bench.py
 |-- bootstrap_generality_bench.py
 `-- README.md
 ```
@@ -148,6 +150,7 @@ The script:
 python ./scenario_matrix_bench.py
 python ./advanced_pipeline_bench.py
 python ./python_interop_bench.py
+python ./noninvasive_reflection_bench.py
 python ./bootstrap_generality_bench.py
 ```
 
@@ -155,6 +158,7 @@ python ./bootstrap_generality_bench.py
 python .\scenario_matrix_bench.py
 python .\advanced_pipeline_bench.py
 python .\python_interop_bench.py
+python .\noninvasive_reflection_bench.py
 python .\bootstrap_generality_bench.py
 ```
 
@@ -192,6 +196,8 @@ Reports are written to `results/`:
   - real incremental edits + scale curve + link share + reachability matrix
 - `*-python-interop.json`
   - Python boundary overhead and throughput comparison
+- `*-noninvasive-reflection-bench.json`
+  - non-invasive reflection overhead summary and threshold checks
 - `*-bootstrap-generality.json`
   - capability coverage + correctness proof status
 

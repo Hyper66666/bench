@@ -1,9 +1,11 @@
 ﻿#!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
+import socket
 import shutil
 import subprocess
 import sys
@@ -17,8 +19,16 @@ SCALE_LOC_BUCKETS = [1000, 10000, 100000]
 SCALE_ITERS_BY_LOC = {
     1000: 3,
     10000: 2,
-    100000: 1,
+    100000: 3,
 }
+DAEMON_REAL_INCREMENTAL_WARMUP_ITERS = 1
+REACHABILITY_LOC = 100000
+REACHABILITY_ITERS = 2
+REACHABILITY_PROFILES = [
+    "all_reachable",
+    "half_reachable",
+    "library_entryless",
+]
 
 
 INCREMENTAL_SCENARIOS = [
@@ -26,6 +36,13 @@ INCREMENTAL_SCENARIOS = [
     "function_signature_change",
     "add_new_function",
 ]
+
+TARGET_REAL_INCREMENTAL_MS = 200.0
+TARGET_FULL_BUILD_100K_MS = 2000.0
+TARGET_FRONTEND_100K_MS = 300.0
+TARGET_CODEGEN_100K_MS = 1500.0
+TARGET_LINK_100K_MS = 500.0
+DEFAULT_DAEMON_ADDR = "127.0.0.1:48768"
 
 
 def now_unix_ms() -> int:
@@ -128,13 +145,126 @@ def resolve_sengoo_root(bench_root: Path) -> Path:
 
 
 def resolve_sgc_binary(sengoo_root: Path) -> Path:
-    for candidate in [
+    candidates = [
         sengoo_root / "target" / "release" / exe_name("sgc"),
         sengoo_root / "target" / "debug" / exe_name("sgc"),
-    ]:
-        if candidate.exists():
+    ]
+    existing = [candidate for candidate in candidates if candidate.exists()]
+    if not existing:
+        raise RuntimeError("sgc binary not found; run `cargo build -p sgc --release` first")
+
+    for candidate in existing:
+        if supports_daemon_subcommand(candidate):
             return candidate
-    raise RuntimeError("sgc binary not found; run `cargo build -p sgc --release` first")
+    return existing[0]
+
+
+def supports_daemon_subcommand(binary: Path) -> bool:
+    proc = subprocess.run(
+        [str(binary), "--help"],
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        return False
+    return "daemon" in proc.stdout.lower()
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run advanced benchmark pipeline "
+            "(real incremental + scale curve + optional daemon comparison)."
+        )
+    )
+    parser.add_argument(
+        "--daemon-compare",
+        action="store_true",
+        help="run additional Sengoo real-incremental measurements with sgc daemon enabled",
+    )
+    parser.add_argument(
+        "--daemon-addr",
+        default=DEFAULT_DAEMON_ADDR,
+        help=f"sgc daemon listen/connect address (default: {DEFAULT_DAEMON_ADDR})",
+    )
+    return parser.parse_args()
+
+
+def wait_for_tcp(addr: str, timeout_s: float) -> bool:
+    host, port_text = addr.rsplit(":", 1)
+    port = int(port_text)
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.3)
+            try:
+                sock.connect((host, port))
+                return True
+            except OSError:
+                time.sleep(0.1)
+    return False
+
+
+def start_sgc_daemon(sgc_bin: Path, sengoo_root: Path, addr: str) -> subprocess.Popen[Any]:
+    proc = subprocess.Popen(
+        [str(sgc_bin), "daemon", "--addr", addr],
+        cwd=str(sengoo_root),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    if wait_for_tcp(addr, timeout_s=8.0):
+        return proc
+
+    stop_sgc_daemon(proc)
+    raise RuntimeError(f"sgc daemon failed to start on {addr}")
+
+
+def stop_sgc_daemon(proc: subprocess.Popen[Any] | None) -> None:
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def latest_advanced_report_path(results_dir: Path) -> Path | None:
+    files = sorted(
+        results_dir.glob("*-advanced-pipeline.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not files:
+        return None
+    return files[0]
+
+
+def sengoo_build_cmd(
+    sgc_bin: Path,
+    input_file: Path,
+    opt_level: int,
+    force_rebuild: bool,
+    *,
+    emit_llvm: bool = False,
+    output: Path | None = None,
+    daemon_addr: str | None = None,
+) -> list[str]:
+    cmd = [str(sgc_bin), "build", str(input_file), "-O", str(opt_level)]
+    if emit_llvm:
+        cmd.append("--emit-llvm")
+    if output is not None:
+        cmd.extend(["-o", str(output)])
+    if force_rebuild:
+        cmd.append("--force-rebuild")
+    if daemon_addr:
+        cmd.extend(["--daemon", "--daemon-addr", daemon_addr])
+    return cmd
 
 
 def render_incremental_sources_sengoo(scenario: str, mutated: bool) -> dict[str, str]:
@@ -627,10 +757,14 @@ def measure_real_incremental(
     cargo: str,
     py: str,
     sengoo_root: Path,
+    *,
+    include_languages: tuple[str, ...] = ("sengoo", "cpp", "rust", "python"),
+    sengoo_daemon_addr: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     work = bench_root / ".advanced-work" / "real-incremental"
     clear_dir(work)
     results: dict[str, dict[str, Any]] = {}
+    enabled = set(include_languages)
 
     rust_env = {
         "CARGO_INCREMENTAL": "1",
@@ -639,109 +773,150 @@ def measure_real_incremental(
     for scenario in INCREMENTAL_SCENARIOS:
         results[scenario] = {}
 
-        # Sengoo
-        sg_dir = work / "sengoo" / scenario
-        clear_dir(sg_dir)
-        before_samples: list[float] = []
-        after_samples: list[float] = []
-        for _ in range(INCREMENTAL_ITERS):
-            write_sources(sg_dir, render_incremental_sources_sengoo(scenario, mutated=False))
-            before_samples.append(
-                measure_command_ms(
-                    [str(sgc_bin), "build", str(sg_dir / "main.sg"), "-O", "2", "--force-rebuild"],
-                    cwd=sengoo_root,
+        if "sengoo" in enabled:
+            sg_dir = work / "sengoo" / scenario
+            clear_dir(sg_dir)
+            before_samples: list[float] = []
+            after_samples: list[float] = []
+            if sengoo_daemon_addr:
+                # Warm daemon path once per scenario to reduce cold-start and first-request jitter.
+                for _ in range(DAEMON_REAL_INCREMENTAL_WARMUP_ITERS):
+                    write_sources(sg_dir, render_incremental_sources_sengoo(scenario, mutated=False))
+                    run_checked(
+                        sengoo_build_cmd(
+                            sgc_bin,
+                            sg_dir / "main.sg",
+                            2,
+                            True,
+                            daemon_addr=sengoo_daemon_addr,
+                        ),
+                        cwd=sengoo_root,
+                    )
+                    write_sources(sg_dir, render_incremental_sources_sengoo(scenario, mutated=True))
+                    run_checked(
+                        sengoo_build_cmd(
+                            sgc_bin,
+                            sg_dir / "main.sg",
+                            2,
+                            False,
+                            daemon_addr=sengoo_daemon_addr,
+                        ),
+                        cwd=sengoo_root,
+                    )
+            for _ in range(INCREMENTAL_ITERS):
+                write_sources(sg_dir, render_incremental_sources_sengoo(scenario, mutated=False))
+                before_samples.append(
+                    measure_command_ms(
+                        sengoo_build_cmd(
+                            sgc_bin,
+                            sg_dir / "main.sg",
+                            2,
+                            True,
+                            daemon_addr=sengoo_daemon_addr,
+                        ),
+                        cwd=sengoo_root,
+                    )
                 )
-            )
-            write_sources(sg_dir, render_incremental_sources_sengoo(scenario, mutated=True))
-            after_samples.append(
-                measure_command_ms(
-                    [str(sgc_bin), "build", str(sg_dir / "main.sg"), "-O", "2"],
-                    cwd=sengoo_root,
+                write_sources(sg_dir, render_incremental_sources_sengoo(scenario, mutated=True))
+                after_samples.append(
+                    measure_command_ms(
+                        sengoo_build_cmd(
+                            sgc_bin,
+                            sg_dir / "main.sg",
+                            2,
+                            False,
+                            daemon_addr=sengoo_daemon_addr,
+                        ),
+                        cwd=sengoo_root,
+                    )
                 )
-            )
-        bavg = average(before_samples) or 0.0
-        aavg = average(after_samples) or 0.0
-        results[scenario]["sengoo"] = {
-            "before_samples_ms": before_samples,
-            "after_samples_ms": after_samples,
-            "before_avg_ms": bavg,
-            "after_avg_ms": aavg,
-            "reduction_pct": ((bavg - aavg) / bavg * 100.0) if bavg > 0 else None,
-        }
+            bavg = average(before_samples) or 0.0
+            aavg = average(after_samples) or 0.0
+            results[scenario]["sengoo"] = {
+                "before_samples_ms": before_samples,
+                "after_samples_ms": after_samples,
+                "before_avg_ms": bavg,
+                "after_avg_ms": aavg,
+                "reduction_pct": ((bavg - aavg) / bavg * 100.0) if bavg > 0 else None,
+            }
 
-        # C++ with PCH
-        cpp_dir = work / "cpp" / scenario
-        clear_dir(cpp_dir)
-        before_samples = []
-        after_samples = []
-        changed_units = ["main.cpp"]
-        if scenario == "function_signature_change":
-            changed_units = ["math_util.cpp", "main.cpp"]
-        for _ in range(INCREMENTAL_ITERS):
-            write_sources(cpp_dir, render_incremental_sources_cpp(scenario, mutated=False))
-            build_cpp_pch(clangpp, cpp_dir)
-            before_samples.append(cpp_full_build_ms(clangpp, cpp_dir))
-            write_sources(cpp_dir, render_incremental_sources_cpp(scenario, mutated=True))
-            after_samples.append(cpp_incremental_build_ms(clangpp, cpp_dir, changed_units))
-        bavg = average(before_samples) or 0.0
-        aavg = average(after_samples) or 0.0
-        results[scenario]["cpp"] = {
-            "before_samples_ms": before_samples,
-            "after_samples_ms": after_samples,
-            "before_avg_ms": bavg,
-            "after_avg_ms": aavg,
-            "reduction_pct": ((bavg - aavg) / bavg * 100.0) if bavg > 0 else None,
-            "fairness": {"pch_enabled": True},
-        }
+        if "cpp" in enabled:
+            cpp_dir = work / "cpp" / scenario
+            clear_dir(cpp_dir)
+            before_samples = []
+            after_samples = []
+            changed_units = ["main.cpp"]
+            if scenario == "function_signature_change":
+                changed_units = ["math_util.cpp", "main.cpp"]
+            for _ in range(INCREMENTAL_ITERS):
+                write_sources(cpp_dir, render_incremental_sources_cpp(scenario, mutated=False))
+                build_cpp_pch(clangpp, cpp_dir)
+                before_samples.append(cpp_full_build_ms(clangpp, cpp_dir))
+                write_sources(cpp_dir, render_incremental_sources_cpp(scenario, mutated=True))
+                after_samples.append(cpp_incremental_build_ms(clangpp, cpp_dir, changed_units))
+            bavg = average(before_samples) or 0.0
+            aavg = average(after_samples) or 0.0
+            results[scenario]["cpp"] = {
+                "before_samples_ms": before_samples,
+                "after_samples_ms": after_samples,
+                "before_avg_ms": bavg,
+                "after_avg_ms": aavg,
+                "reduction_pct": ((bavg - aavg) / bavg * 100.0) if bavg > 0 else None,
+                "fairness": {"pch_enabled": True},
+            }
 
-        # Rust (cargo incremental)
-        rust_dir = work / "rust" / scenario
-        clear_dir(rust_dir)
-        before_samples = []
-        after_samples = []
-        for _ in range(INCREMENTAL_ITERS):
-            write_sources(rust_dir, render_incremental_sources_rust(scenario, mutated=False))
-            target_dir = rust_dir / "target"
-            if target_dir.exists():
-                shutil.rmtree(target_dir)
-            before_samples.append(
-                measure_command_ms([cargo, "build", "--quiet"], cwd=rust_dir, env=rust_env)
-            )
-            write_sources(rust_dir, render_incremental_sources_rust(scenario, mutated=True))
-            after_samples.append(
-                measure_command_ms([cargo, "build", "--quiet"], cwd=rust_dir, env=rust_env)
-            )
-        bavg = average(before_samples) or 0.0
-        aavg = average(after_samples) or 0.0
-        results[scenario]["rust"] = {
-            "before_samples_ms": before_samples,
-            "after_samples_ms": after_samples,
-            "before_avg_ms": bavg,
-            "after_avg_ms": aavg,
-            "reduction_pct": ((bavg - aavg) / bavg * 100.0) if bavg > 0 else None,
-            "fairness": {"cargo_incremental": True},
-        }
+        if "rust" in enabled:
+            rust_dir = work / "rust" / scenario
+            clear_dir(rust_dir)
+            before_samples = []
+            after_samples = []
+            for _ in range(INCREMENTAL_ITERS):
+                write_sources(rust_dir, render_incremental_sources_rust(scenario, mutated=False))
+                target_dir = rust_dir / "target"
+                if target_dir.exists():
+                    shutil.rmtree(target_dir)
+                before_samples.append(
+                    measure_command_ms([cargo, "build", "--quiet"], cwd=rust_dir, env=rust_env)
+                )
+                write_sources(rust_dir, render_incremental_sources_rust(scenario, mutated=True))
+                after_samples.append(
+                    measure_command_ms([cargo, "build", "--quiet"], cwd=rust_dir, env=rust_env)
+                )
+            bavg = average(before_samples) or 0.0
+            aavg = average(after_samples) or 0.0
+            results[scenario]["rust"] = {
+                "before_samples_ms": before_samples,
+                "after_samples_ms": after_samples,
+                "before_avg_ms": bavg,
+                "after_avg_ms": aavg,
+                "reduction_pct": ((bavg - aavg) / bavg * 100.0) if bavg > 0 else None,
+                "fairness": {"cargo_incremental": True},
+            }
 
-        # Python
-        py_dir = work / "python" / scenario
-        clear_dir(py_dir)
-        before_samples = []
-        after_samples = []
-        for _ in range(INCREMENTAL_ITERS):
-            write_sources(py_dir, render_incremental_sources_python(scenario, mutated=False))
-            clear_pycache(py_dir)
-            before_samples.append(measure_command_ms([py, "-m", "compileall", "-q", str(py_dir)], cwd=py_dir))
-            write_sources(py_dir, render_incremental_sources_python(scenario, mutated=True))
-            after_samples.append(measure_command_ms([py, "-m", "compileall", "-q", str(py_dir)], cwd=py_dir))
-        bavg = average(before_samples) or 0.0
-        aavg = average(after_samples) or 0.0
-        results[scenario]["python"] = {
-            "before_samples_ms": before_samples,
-            "after_samples_ms": after_samples,
-            "before_avg_ms": bavg,
-            "after_avg_ms": aavg,
-            "reduction_pct": ((bavg - aavg) / bavg * 100.0) if bavg > 0 else None,
-        }
+        if "python" in enabled:
+            py_dir = work / "python" / scenario
+            clear_dir(py_dir)
+            before_samples = []
+            after_samples = []
+            for _ in range(INCREMENTAL_ITERS):
+                write_sources(py_dir, render_incremental_sources_python(scenario, mutated=False))
+                clear_pycache(py_dir)
+                before_samples.append(
+                    measure_command_ms([py, "-m", "compileall", "-q", str(py_dir)], cwd=py_dir)
+                )
+                write_sources(py_dir, render_incremental_sources_python(scenario, mutated=True))
+                after_samples.append(
+                    measure_command_ms([py, "-m", "compileall", "-q", str(py_dir)], cwd=py_dir)
+                )
+            bavg = average(before_samples) or 0.0
+            aavg = average(after_samples) or 0.0
+            results[scenario]["python"] = {
+                "before_samples_ms": before_samples,
+                "after_samples_ms": after_samples,
+                "before_avg_ms": bavg,
+                "after_avg_ms": aavg,
+                "reduction_pct": ((bavg - aavg) / bavg * 100.0) if bavg > 0 else None,
+            }
 
     return results
 
@@ -769,6 +944,41 @@ def make_scale_source_sengoo(target_loc: int) -> str:
         ]
     )
     return "\n".join(lines) + "\n"
+
+
+def make_reachability_source_sengoo(profile: str, target_loc: int) -> tuple[str, str]:
+    fn_count = max(100, target_loc // 4)
+    reachable_count = fn_count
+    include_main = True
+    if profile == "half_reachable":
+        reachable_count = max(1, fn_count // 2)
+    elif profile == "library_entryless":
+        include_main = False
+    elif profile != "all_reachable":
+        raise ValueError(f"unknown reachability profile: {profile}")
+
+    lines: list[str] = []
+    for i in range(fn_count):
+        lines.append(f"def f{i}(x: i64) -> i64 {{")
+        if i < reachable_count - 1:
+            lines.append(f"    f{i + 1}(x + {i % 7})")
+        else:
+            lines.append(f"    x + {i % 7}")
+        lines.append("}")
+        lines.append("")
+
+    if include_main:
+        lines.extend(
+            [
+                "def main() -> i64 {",
+                "    print(f0(42))",
+                "    0",
+                "}",
+            ]
+        )
+
+    file_name = "main.sg" if include_main else "lib.sg"
+    return file_name, "\n".join(lines) + "\n"
 
 
 def make_scale_source_cpp(target_loc: int) -> str:
@@ -844,6 +1054,8 @@ def measure_scale_curve(
     cargo: str,
     py: str,
     sengoo_root: Path,
+    *,
+    sengoo_daemon_addr: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     work = bench_root / ".advanced-work" / "scale-curve"
     clear_dir(work)
@@ -876,7 +1088,15 @@ def measure_scale_curve(
             obj = sg_dir / "main.obj"
             exe = sg_dir / exe_name("main")
             front_ms = measure_command_ms(
-                [str(sgc_bin), "build", str(sg_dir / "main.sg"), "-O", "2", "--emit-llvm", "-o", str(ll), "--force-rebuild"],
+                sengoo_build_cmd(
+                    sgc_bin,
+                    sg_dir / "main.sg",
+                    2,
+                    True,
+                    emit_llvm=True,
+                    output=ll,
+                    daemon_addr=sengoo_daemon_addr,
+                ),
                 cwd=sengoo_root,
             )
             backend_ms = measure_command_ms([clangpp, "-O2", "-x", "ir", "-c", str(ll), "-o", str(obj)], cwd=sg_dir)
@@ -977,6 +1197,85 @@ edition = "2021"
     return results
 
 
+def measure_reachability_matrix(
+    bench_root: Path,
+    sgc_bin: Path,
+    clangpp: str,
+    sengoo_root: Path,
+    *,
+    sengoo_daemon_addr: str | None = None,
+) -> dict[str, Any]:
+    work = bench_root / ".advanced-work" / "reachability-matrix"
+    clear_dir(work)
+    results: dict[str, Any] = {}
+
+    runtime_c = sengoo_root / "tools" / "stdlib" / "runtime.c"
+    if not runtime_c.exists():
+        raise RuntimeError(f"runtime source not found: {runtime_c}")
+    runtime_obj = work / "sengoo_runtime.obj"
+    run_checked([clangpp, "-O2", "-x", "c", "-c", str(runtime_c), "-o", str(runtime_obj)], cwd=sengoo_root)
+
+    for profile in REACHABILITY_PROFILES:
+        profile_dir = work / profile
+        clear_dir(profile_dir)
+        source_file, source_text = make_reachability_source_sengoo(profile, REACHABILITY_LOC)
+        src_path = profile_dir / source_file
+        write_file(src_path, source_text)
+
+        front_samples: list[float] = []
+        backend_samples: list[float] = []
+        link_samples: list[float] = []
+        e2e_samples: list[float] = []
+
+        for _ in range(REACHABILITY_ITERS):
+            ll = profile_dir / f"{profile}.ll"
+            obj = profile_dir / f"{profile}.obj"
+            exe = profile_dir / exe_name(profile)
+            front_ms = measure_command_ms(
+                sengoo_build_cmd(
+                    sgc_bin,
+                    src_path,
+                    2,
+                    True,
+                    emit_llvm=True,
+                    output=ll,
+                    daemon_addr=sengoo_daemon_addr,
+                ),
+                cwd=sengoo_root,
+            )
+            backend_ms = measure_command_ms([clangpp, "-O2", "-x", "ir", "-c", str(ll), "-o", str(obj)], cwd=profile_dir)
+            front_samples.append(front_ms)
+            backend_samples.append(backend_ms)
+
+            if profile == "library_entryless":
+                e2e_samples.append(front_ms + backend_ms)
+            else:
+                link_ms = measure_command_ms([clangpp, str(obj), str(runtime_obj), "-o", str(exe)], cwd=profile_dir)
+                link_samples.append(link_ms)
+                e2e_samples.append(front_ms + backend_ms + link_ms)
+
+        results[profile] = {
+            "compile_frontend_llvm_avg_ms": average(front_samples),
+            "codegen_obj_avg_ms": average(backend_samples),
+            "link_avg_ms": average(link_samples) if link_samples else None,
+            "e2e_avg_ms": average(e2e_samples),
+            "e2e_p50_ms": percentile(e2e_samples, 0.50),
+            "iters": REACHABILITY_ITERS,
+            "loc_target": REACHABILITY_LOC,
+        }
+
+    all_reachable = results.get("all_reachable", {})
+    half_reachable = results.get("half_reachable", {})
+    entryless = results.get("library_entryless", {})
+    results["delta_vs_all_reachable_ms"] = {
+        "half_reachable_e2e_delta_ms": float(half_reachable.get("e2e_avg_ms", 0.0) or 0.0)
+        - float(all_reachable.get("e2e_avg_ms", 0.0) or 0.0),
+        "library_entryless_e2e_delta_ms": float(entryless.get("e2e_avg_ms", 0.0) or 0.0)
+        - float(all_reachable.get("e2e_avg_ms", 0.0) or 0.0),
+    }
+    return results
+
+
 def print_incremental_tables(real_incremental: dict[str, dict[str, Any]]) -> None:
     langs = ["sengoo", "cpp", "rust", "python"]
     print("")
@@ -1019,19 +1318,225 @@ def print_scale_tables(scale_curve: dict[str, dict[str, Any]]) -> None:
         print(f"| {loc_key} | {sg_share:.2f} | {cpp_share:.2f} |")
 
 
+def print_reachability_matrix(reachability_matrix: dict[str, Any]) -> None:
+    print("")
+    print("Reachability Matrix (Sengoo, 100k LOC)")
+    print("| Profile | Frontend (ms) | Codegen (ms) | Link (ms) | E2E (ms) |")
+    print("|---|---:|---:|---:|---:|")
+    for profile in REACHABILITY_PROFILES:
+        metrics = reachability_matrix.get(profile, {})
+        frontend = float(metrics.get("compile_frontend_llvm_avg_ms", 0.0) or 0.0)
+        codegen = float(metrics.get("codegen_obj_avg_ms", 0.0) or 0.0)
+        link = metrics.get("link_avg_ms")
+        link_str = "n/a" if link is None else f"{float(link):.2f}"
+        e2e = float(metrics.get("e2e_avg_ms", 0.0) or 0.0)
+        print(f"| {profile} | {frontend:.2f} | {codegen:.2f} | {link_str} | {e2e:.2f} |")
+
+    deltas = reachability_matrix.get("delta_vs_all_reachable_ms", {})
+    half_delta = float(deltas.get("half_reachable_e2e_delta_ms", 0.0) or 0.0)
+    entryless_delta = float(deltas.get("library_entryless_e2e_delta_ms", 0.0) or 0.0)
+    print("")
+    print(f"Reachability deltas vs all_reachable: half={half_delta:.2f}ms, entryless={entryless_delta:.2f}ms")
+
+
+def compute_phase_deltas(
+    real_incremental: dict[str, dict[str, Any]],
+    scale_curve: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    incremental: dict[str, Any] = {}
+    for scenario in INCREMENTAL_SCENARIOS:
+        sengoo = real_incremental.get(scenario, {}).get("sengoo", {})
+        before_avg = float(sengoo.get("before_avg_ms", 0.0) or 0.0)
+        after_avg = float(sengoo.get("after_avg_ms", 0.0) or 0.0)
+        incremental[scenario] = {
+            "before_minus_after_ms": before_avg - after_avg,
+            "after_minus_target_ms": after_avg - TARGET_REAL_INCREMENTAL_MS,
+        }
+
+    scale: dict[str, Any] = {}
+    for loc in [str(x) for x in SCALE_LOC_BUCKETS]:
+        sengoo = scale_curve.get(loc, {}).get("sengoo", {})
+        frontend = float(sengoo.get("compile_frontend_llvm_avg_ms", 0.0) or 0.0)
+        codegen = float(sengoo.get("codegen_obj_avg_ms", 0.0) or 0.0)
+        link = float(sengoo.get("link_avg_ms", 0.0) or 0.0)
+        e2e = float(sengoo.get("e2e_avg_ms", 0.0) or 0.0)
+        scale[loc] = {
+            "frontend_share_pct": (frontend / e2e * 100.0) if e2e > 0 else 0.0,
+            "codegen_share_pct": (codegen / e2e * 100.0) if e2e > 0 else 0.0,
+            "link_share_pct": (link / e2e * 100.0) if e2e > 0 else 0.0,
+        }
+
+    scale_100k = scale_curve.get("100000", {}).get("sengoo", {})
+    return {
+        "incremental_vs_target_ms": incremental,
+        "scale_phase_share_pct": scale,
+        "scale_100k_vs_target_ms": {
+            "frontend_minus_target_ms": float(scale_100k.get("compile_frontend_llvm_avg_ms", 0.0) or 0.0)
+            - TARGET_FRONTEND_100K_MS,
+            "codegen_minus_target_ms": float(scale_100k.get("codegen_obj_avg_ms", 0.0) or 0.0)
+            - TARGET_CODEGEN_100K_MS,
+            "link_minus_target_ms": float(scale_100k.get("link_avg_ms", 0.0) or 0.0) - TARGET_LINK_100K_MS,
+            "e2e_minus_target_ms": float(scale_100k.get("e2e_avg_ms", 0.0) or 0.0) - TARGET_FULL_BUILD_100K_MS,
+        },
+    }
+
+
+def flatten_phase_snapshot(report: dict[str, Any]) -> dict[str, float]:
+    snapshot: dict[str, float] = {}
+    real_incremental = report.get("real_incremental", {})
+    if isinstance(real_incremental, dict):
+        for scenario in INCREMENTAL_SCENARIOS:
+            value = (
+                real_incremental.get(scenario, {})
+                .get("sengoo", {})
+                .get("after_avg_ms")
+            )
+            if isinstance(value, (int, float)):
+                snapshot[f"real_incremental/{scenario}/sengoo/after_avg_ms"] = float(value)
+
+    scale_curve = report.get("scale_curve", {})
+    if isinstance(scale_curve, dict):
+        sengoo_100k = scale_curve.get("100000", {}).get("sengoo", {})
+        for key in (
+            "compile_frontend_llvm_avg_ms",
+            "codegen_obj_avg_ms",
+            "link_avg_ms",
+            "e2e_avg_ms",
+        ):
+            value = sengoo_100k.get(key)
+            if isinstance(value, (int, float)):
+                snapshot[f"scale_curve/100000/sengoo/{key}"] = float(value)
+
+    reachability_matrix = report.get("reachability_matrix", {})
+    if isinstance(reachability_matrix, dict):
+        for profile in REACHABILITY_PROFILES:
+            metrics = reachability_matrix.get(profile, {})
+            if not isinstance(metrics, dict):
+                continue
+            for key in (
+                "compile_frontend_llvm_avg_ms",
+                "codegen_obj_avg_ms",
+                "e2e_avg_ms",
+            ):
+                value = metrics.get(key)
+                if isinstance(value, (int, float)):
+                    snapshot[f"reachability_matrix/{profile}/{key}"] = float(value)
+
+    return snapshot
+
+
+def compute_delta_vs_previous(previous_report: dict[str, Any], current_report: dict[str, Any]) -> dict[str, Any]:
+    previous = flatten_phase_snapshot(previous_report)
+    current = flatten_phase_snapshot(current_report)
+    deltas: dict[str, Any] = {}
+    for key, current_value in sorted(current.items()):
+        if key not in previous:
+            continue
+        previous_value = previous[key]
+        delta_ms = current_value - previous_value
+        delta_pct = (delta_ms / previous_value * 100.0) if previous_value != 0 else None
+        deltas[key] = {
+            "previous": previous_value,
+            "current": current_value,
+            "delta_ms": delta_ms,
+            "delta_pct": delta_pct,
+        }
+    return deltas
+
+
+def compute_daemon_comparison(
+    oneshot_real_incremental: dict[str, dict[str, Any]],
+    daemon_real_incremental: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for scenario in INCREMENTAL_SCENARIOS:
+        oneshot = oneshot_real_incremental.get(scenario, {}).get("sengoo", {})
+        daemon = daemon_real_incremental.get(scenario, {}).get("sengoo", {})
+        one_after = float(oneshot.get("after_avg_ms", 0.0) or 0.0)
+        daemon_after = float(daemon.get("after_avg_ms", 0.0) or 0.0)
+        delta_ms = daemon_after - one_after
+        delta_pct = (delta_ms / one_after * 100.0) if one_after > 0 else None
+        out[scenario] = {
+            "oneshot_after_avg_ms": one_after,
+            "daemon_after_avg_ms": daemon_after,
+            "daemon_minus_oneshot_ms": delta_ms,
+            "daemon_minus_oneshot_pct": delta_pct,
+        }
+    return out
+
+
+def print_phase_delta_summary(phase_deltas: dict[str, Any]) -> None:
+    print("")
+    print("Phase Deltas (Sengoo)")
+    print("| Metric | Delta (ms) |")
+    print("|---|---:|")
+    scale_100k = phase_deltas.get("scale_100k_vs_target_ms", {})
+    for key in (
+        "frontend_minus_target_ms",
+        "codegen_minus_target_ms",
+        "link_minus_target_ms",
+        "e2e_minus_target_ms",
+    ):
+        value = float(scale_100k.get(key, 0.0) or 0.0)
+        print(f"| 100k {key} | {value:.2f} |")
+
+
+def print_daemon_comparison(daemon_comparison: dict[str, Any]) -> None:
+    print("")
+    print("Daemon vs One-shot (Sengoo Real Incremental)")
+    print("| Scenario | One-shot after (ms) | Daemon after (ms) | Delta (ms) |")
+    print("|---|---:|---:|---:|")
+    for scenario in INCREMENTAL_SCENARIOS:
+        metrics = daemon_comparison.get(scenario, {})
+        print(
+            "| "
+            f"{scenario} | "
+            f"{float(metrics.get('oneshot_after_avg_ms', 0.0)):.2f} | "
+            f"{float(metrics.get('daemon_after_avg_ms', 0.0)):.2f} | "
+            f"{float(metrics.get('daemon_minus_oneshot_ms', 0.0)):.2f} |"
+        )
+
+
 def main() -> int:
+    args = parse_args()
     bench_root = Path(__file__).resolve().parent
     sengoo_root = resolve_sengoo_root(bench_root)
     results_dir = bench_root / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
+    previous_report_path = latest_advanced_report_path(results_dir)
 
     sgc_bin = resolve_sgc_binary(sengoo_root)
     clangpp = require_tool("clang++")
     cargo = require_tool("cargo")
     py = sys.executable
+    if args.daemon_compare and not supports_daemon_subcommand(sgc_bin):
+        raise RuntimeError(
+            f"selected sgc binary does not support daemon mode: {sgc_bin} (rebuild sgc)"
+        )
 
     real_incremental = measure_real_incremental(bench_root, sgc_bin, clangpp, cargo, py, sengoo_root)
     scale_curve = measure_scale_curve(bench_root, sgc_bin, clangpp, cargo, py, sengoo_root)
+    reachability_matrix = measure_reachability_matrix(bench_root, sgc_bin, clangpp, sengoo_root)
+    phase_deltas = compute_phase_deltas(real_incremental, scale_curve)
+
+    daemon_comparison: dict[str, Any] | None = None
+    if args.daemon_compare:
+        daemon_proc: subprocess.Popen[Any] | None = None
+        try:
+            daemon_proc = start_sgc_daemon(sgc_bin, sengoo_root, args.daemon_addr)
+            daemon_incremental = measure_real_incremental(
+                bench_root,
+                sgc_bin,
+                clangpp,
+                cargo,
+                py,
+                sengoo_root,
+                include_languages=("sengoo",),
+                sengoo_daemon_addr=args.daemon_addr,
+            )
+            daemon_comparison = compute_daemon_comparison(real_incremental, daemon_incremental)
+        finally:
+            stop_sgc_daemon(daemon_proc)
 
     report: dict[str, Any] = {
         "schema_version": 1,
@@ -1040,6 +1545,9 @@ def main() -> int:
             "incremental_iterations": INCREMENTAL_ITERS,
             "scale_loc_buckets": SCALE_LOC_BUCKETS,
             "scale_iterations_by_loc": SCALE_ITERS_BY_LOC,
+            "reachability_loc": REACHABILITY_LOC,
+            "reachability_iters": REACHABILITY_ITERS,
+            "reachability_profiles": REACHABILITY_PROFILES,
         },
         "fairness": {
             "cpp": "precompiled header (PCH) enabled",
@@ -1047,12 +1555,24 @@ def main() -> int:
         },
         "real_incremental": real_incremental,
         "scale_curve": scale_curve,
+        "reachability_matrix": reachability_matrix,
+        "phase_deltas": phase_deltas,
         "notes": [
             "Scale curve e2e includes link time for compiled languages.",
             "Sengoo uses split timing: front-end LLVM emit + clang IR codegen + clang link.",
             "Rust uses cargo build e2e timing; split link-only timing is not isolated.",
+            "Reachability matrix validates optimization generality across all/half/entryless profiles.",
         ],
     }
+    if daemon_comparison is not None:
+        report["daemon_comparison"] = daemon_comparison
+    if previous_report_path and previous_report_path.exists():
+        previous_report = json.loads(previous_report_path.read_text(encoding="utf-8"))
+        report["phase_deltas"]["delta_vs_previous"] = compute_delta_vs_previous(
+            previous_report,
+            report,
+        )
+        report["phase_deltas"]["previous_report"] = str(previous_report_path)
 
     out_path = results_dir / f"{now_unix_ms()}-advanced-pipeline.json"
     out_path.write_text(json.dumps(report, indent=2), encoding="utf-8", newline="\n")
@@ -1060,6 +1580,10 @@ def main() -> int:
     print(f"Advanced bench report: {out_path}")
     print_incremental_tables(real_incremental)
     print_scale_tables(scale_curve)
+    print_reachability_matrix(reachability_matrix)
+    print_phase_delta_summary(phase_deltas)
+    if daemon_comparison is not None:
+        print_daemon_comparison(daemon_comparison)
     return 0
 
 

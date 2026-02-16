@@ -1,331 +1,432 @@
-﻿# Sengoo Bench
+# Sengoo Bench
 
-Independent benchmark/test repository for Sengoo.
+Independent benchmark and verification repository for Sengoo.
 
-Goal: keep performance tracking and test assets evolving independently from compiler core code.
+This repo is designed for one purpose: **measure performance and correctness trends with reproducible scripts**.
 
-## What You Get
+## What This Repository Covers
 
-- Runtime / full compile / incremental compile benchmark suites
-- Python interoperability benchmark suite (Sengoo Runtime / Rust / C++ / Python baseline)
-- Bootstrap generality proof suite (feature-coverage + correctness evidence)
-- Perf gate scripts (soft/hard mode)
-- Advanced KPI gate script for real incremental / scale / link targets
-- E2E smoke scripts
-- Cross-language benchmark harness (Sengoo vs C++/Rust/Python)
+- Cross-language performance matrix (Sengoo vs C++ vs Rust vs Python)
+- Real incremental compile scenarios (loop-body change, signature change, add function)
+- Scale curve (1k / 10k / 100k LOC)
+- Link-share and phase split analysis
+- Python interoperability benchmark (Sengoo Runtime / Rust PyO3 / C++ CPython API / Python native)
+- Bootstrap generality proof (multi-capability correctness + latency)
+- CI gate scripts (soft/hard) for KPI enforcement
+- E2E smoke scripts for baseline toolchain health
 
-## Layout
+## Repository Layout
 
-- `suites/runtime/`
-- `suites/compile/`
-- `suites/incremental/`
-- `tests/`
-- `scripts/`
-- `baseline.json`
-- `FRONTEND_BASELINE.md`
-- `results/`
+```text
+bench/
+|-- scripts/                       # perf/e2e/gate automation scripts
+|-- suites/                        # suite assets and generated inputs
+|-- tests/                         # sample programs and runnable examples
+|   `-- python_interop_example.py  # direct Python interop example (new)
+|-- results/                       # generated JSON reports (ignored by git)
+|-- advanced_pipeline_bench.py
+|-- scenario_matrix_bench.py
+|-- python_interop_bench.py
+|-- bootstrap_generality_bench.py
+`-- README.md
+```
 
-## Requirements
+## Prerequisites
 
-- Rust toolchain (to build and run `sgc`)
-- Python 3
-- LLVM/Clang (for native backend paths)
-- Sengoo main repository path available via `SENGOO_ROOT`
+Required:
 
-## Quick Usage
+- Python 3.10+
+- Rust toolchain (`cargo`, `rustc`)
+- Sengoo source tree available (set via `SENGOO_ROOT` or sibling layout)
+
+Optional but recommended for full comparability:
+
+- LLVM/Clang (`clang`, `clang++`)
+- C++ toolchain runtime environment
+
+## Clone and Reproduce (From Scratch)
+
+### Option A: Sibling layout (recommended)
 
 ```bash
-# run soft perf gate
-bash ./scripts/perf-gate.sh --mode soft --sample ./sample-regression.json
+# parent dir can be any workspace root
+cd /path/to/workspace
+git clone https://github.com/Hyper66666/Sengoo.git
+git clone https://github.com/Hyper66666/bench.git
 
-# run smoke
-bash ./scripts/e2e-smoke.sh
-
-# run cross-language comparison
-python ./cross_lang_bench.py
-
-# run general scenario matrix (5 scenarios x 4 languages)
-python ./scenario_matrix_bench.py
-
-# run advanced pipeline benchmark
-# (real incremental edits + 1k/10k/100k scale curve + fairness knobs + link share)
-python ./advanced_pipeline_bench.py
-
-# run Python interoperability benchmark
-# (Sengoo Runtime PythonInterop vs Rust PyO3 vs C++ CPython API vs Python native)
-python ./python_interop_bench.py
-
-# run bootstrap generality proof
-# (multi-capability scenario matrix with Python-reference correctness validation)
-python ./bootstrap_generality_bench.py
-
-# optional: include Sengoo daemon on/off comparison on real-incremental scenarios
-python ./advanced_pipeline_bench.py --daemon-compare --daemon-addr 127.0.0.1:48768
-
-# run advanced KPI gate (soft/hard)
-python ./scripts/advanced-kpi-gate.py --mode soft --sample ./results/<latest-advanced-pipeline.json>
-
-# run interop/bootstrap gate (soft/hard)
-python ./scripts/interop-bootstrap-gate.py \
-  --mode soft \
-  --interop-sample ./results/<latest-python-interop.json> \
-  --bootstrap-sample ./results/<latest-bootstrap-generality.json>
+# enter bench repo
+cd bench
 ```
 
 ```powershell
-powershell -File .\scripts\perf-gate.ps1 -Mode soft -Sample .\sample-regression.json
+Set-Location C:\path\to\workspace
+git clone https://github.com/Hyper66666/Sengoo.git
+git clone https://github.com/Hyper66666/bench.git
+Set-Location .\bench
+```
+
+### Option B: Bench is not next to Sengoo
+
+Set `SENGOO_ROOT` explicitly:
+
+```bash
+export SENGOO_ROOT=/absolute/path/to/Sengoo
+```
+
+```powershell
+$env:SENGOO_ROOT = "C:\absolute\path\to\Sengoo"
+```
+
+### Environment check
+
+```bash
+python --version
+cargo --version
+clang --version
+```
+
+```powershell
+python --version
+cargo --version
+clang --version
+```
+
+If `clang` is missing, C++-related runners may be skipped (interop benchmark still produces output for available runners).
+
+## Standard Test Flow
+
+Run from `bench/` root.
+
+### 1) Toolchain smoke (fast sanity)
+
+```bash
+bash ./scripts/e2e-smoke.sh
+```
+
+```powershell
 powershell -File .\scripts\e2e-smoke.ps1
-python .\cross_lang_bench.py
+```
+
+This verifies:
+
+- `sgc check` works
+- LLVM IR emit works
+- daemon happy-path works
+- daemon fallback path works
+
+### 2) Direct Python interop example (new)
+
+This is a ready-to-run example under `tests/` that directly prints summary output:
+
+```bash
+python ./tests/python_interop_example.py
+```
+
+```powershell
+python .\tests\python_interop_example.py
+```
+
+Optional quick tuning:
+
+```bash
+python ./tests/python_interop_example.py --calls 3000 --samples 2 --warmup 0
+```
+
+```powershell
+python .\tests\python_interop_example.py --calls 3000 --samples 2 --warmup 0
+```
+
+The script:
+
+- invokes `python_interop_bench.py`
+- auto-detects the generated JSON report path
+- prints a compact table (`loop_avg_ms`, `calls_per_sec`, `vs_python_native_pct`)
+
+### 3) Core benchmark suites
+
+```bash
+python ./scenario_matrix_bench.py
+python ./advanced_pipeline_bench.py
+python ./python_interop_bench.py
+python ./bootstrap_generality_bench.py
+```
+
+```powershell
 python .\scenario_matrix_bench.py
 python .\advanced_pipeline_bench.py
 python .\python_interop_bench.py
 python .\bootstrap_generality_bench.py
-python .\advanced_pipeline_bench.py --daemon-compare --daemon-addr 127.0.0.1:48768
-python .\scripts\advanced-kpi-gate.py --mode soft --sample .\results\<latest-advanced-pipeline.json>
-python .\scripts\interop-bootstrap-gate.py --mode soft --interop-sample .\results\<latest-python-interop.json> --bootstrap-sample .\results\<latest-bootstrap-generality.json>
 ```
 
-## New Bench Suites
+### 4) Gate checks (soft/hard)
 
-### Python Interop Benchmark
-
-- Script: `python_interop_bench.py`
-- Output: `results/*-python-interop.json`
-- Main metrics:
-  - `init_avg_ms`: interpreter/module setup overhead
-  - `loop_avg_ms`: repeated cross-language Python call overhead
-  - `calls_per_sec`: effective call throughput
-  - `loop_vs_python_native_pct`: relative cost against Python-native baseline
-
-### Bootstrap Generality Proof
-
-- Script: `bootstrap_generality_bench.py`
-- Output: `results/*-bootstrap-generality.json`
-- Main metrics:
-  - scenario-level compile/runtime latency across capabilities
-  - Python-reference correctness check for each scenario
-  - `bootstrap_proof.status` (`pass`/`fail`) from explicit criteria
-
-## Latest New-Suite Snapshots
-
-### Python Interop (Latest)
-
-Report:
-
-- `results/1771230408116-python-interop.json`
-
-| Runner | Init avg (ms) | Loop avg (ms) | Calls/s | vs Python native (%) |
-|---|---:|---:|---:|---:|
-| Python native | 0.26 | 2.18 | 9,156,502.94 | 0.00 |
-| Sengoo Runtime (PythonInterop) | 0.31 | 2.67 | 7,503,958.34 | +22.02 |
-| C++ (CPython C API) | 20.50 | 2.92 | 6,851,896.26 | +33.63 |
-| Rust (PyO3) | 0.36 | 2.93 | 6,825,659.02 | +34.15 |
-
-### Bootstrap Generality Proof (Latest)
-
-Report:
-
-- `results/1771230417893-bootstrap-generality.json`
-
-Proof status:
-
-- `pass` (`6/6` scenarios passed, `6` capability classes covered)
-
-## Advanced KPI Targets
-
-`scripts/advanced-kpi-gate.py` enforces the reference-profile targets:
-
-- Real incremental (`loop_body_change`, `function_signature_change`, `add_new_function`): `after_avg_ms <= 200`
-- Scale full build at `100000 LOC`: `e2e_avg_ms <= 2000`
-- Scale stage budget at `100000 LOC`: `compile_frontend_llvm_avg_ms <= 300`
-- Scale stage budget at `100000 LOC`: `codegen_obj_avg_ms <= 1500`
-- Link time at `100000 LOC`: `link_avg_ms <= 500`
-- Scale stage presence: `1000/10000/100000` all include Sengoo `frontend`, `codegen`, `link` metrics
-- Reachability matrix presence: `all_reachable`, `half_reachable`, `library_entryless` profiles are required
-- Reachability hard budget: `reachability_matrix/all_reachable/compile_frontend_llvm_avg_ms <= 300`
-- Optional daemon regression guard: `daemon_after_avg_ms - oneshot_after_avg_ms <= 50` per scenario
-- Optional phase-delta contract: report includes `phase_deltas` for incremental and scale blocks
-
-Override budget thresholds:
+Advanced KPI gate:
 
 ```bash
-python ./scripts/advanced-kpi-gate.py \
-  --mode soft \
-  --sample ./results/<latest-advanced-pipeline.json> \
-  --max-frontend-100k-ms 300 \
-  --max-codegen-100k-ms 1500 \
-  --require-phase-deltas \
-  --require-daemon-comparison
+python ./scripts/advanced-kpi-gate.py --mode soft --sample ./results/<advanced-report>.json
 ```
 
-Nightly CI runs this gate in `hard` mode and fails the workflow when targets are violated.
+Interop + bootstrap gate:
 
-Frontend refactor baseline is frozen in `FRONTEND_BASELINE.md` with source report
-`results/1771218708000-advanced-pipeline.json`.
+```bash
+python ./scripts/interop-bootstrap-gate.py \
+  --mode soft \
+  --interop-sample ./results/<python-interop-report>.json \
+  --bootstrap-sample ./results/<bootstrap-report>.json
+```
 
-## Frontend Refactor Snapshot (Latest)
+PowerShell:
 
-Reports:
+```powershell
+python .\scripts\advanced-kpi-gate.py --mode soft --sample .\results\<advanced-report>.json
+python .\scripts\interop-bootstrap-gate.py --mode soft --interop-sample .\results\<python-interop-report>.json --bootstrap-sample .\results\<bootstrap-report>.json
+```
 
-- Baseline: `results/1771218708000-advanced-pipeline.json`
-- Current: `results/1771220638259-advanced-pipeline.json`
+## Output Files and How to Read Them
 
-Key deltas (ms):
+Reports are written to `results/`:
 
-| Metric | Baseline | Current | Delta |
-|---|---:|---:|---:|
-| `scale_curve/100000/frontend` | 645.14 | 459.38 | -185.76 |
-| `scale_curve/100000/e2e` | 1149.44 | 971.25 | -178.19 |
-| `reachability/all_reachable/frontend` | 908.54 | 670.34 | -238.21 |
-| `reachability/half_reachable/frontend` | 800.16 | 562.45 | -237.72 |
-| `reachability/library_entryless/frontend` | 910.73 | 653.65 | -257.08 |
+- `*-scenario-matrix.json`
+  - 5-scenario runtime/full/incremental matrix across 4 languages
+- `*-advanced-pipeline.json`
+  - real incremental edits + scale curve + link share + reachability matrix
+- `*-python-interop.json`
+  - Python boundary overhead and throughput comparison
+- `*-bootstrap-generality.json`
+  - capability coverage + correctness proof status
 
-Real incremental `after_avg_ms` (Sengoo):
+Quick interpretation checklist:
 
-| Scenario | Baseline | Current | Delta |
-|---|---:|---:|---:|
-| `loop_body_change` | 198.20 | 225.85 | +27.65 |
-| `function_signature_change` | 180.89 | 212.23 | +31.34 |
-| `add_new_function` | 200.31 | 211.50 | +11.18 |
+- Runtime competitiveness: compare `runtime_p50_avg_ms`
+- Compile throughput: compare `full_compile_avg_ms`
+- Incremental effectiveness: inspect `incremental_reduction_avg_pct`
+- 100k scale bottleneck: check `scale_curve/100000/*`
+- Python boundary cost: check `summary/ordered_by_loop_avg_ms`
 
-## Latest Bench Reports (4 Languages)
+## Latest Snapshot (Measured on February 16, 2026)
 
-### Advanced Pipeline (Real Incremental + Scale Curve + E2E Link)
-
-Report:
-
-- `results/1771197609597-advanced-pipeline.json`
-
-Real incremental scenarios (`Before -> After`, ms):
-
-| Scenario | Sengoo | C++ (PCH) | Rust (cargo incremental) | Python |
-|---|---:|---:|---:|---:|
-| loop_body_change | 852.97 -> 822.61 | 1361.78 -> 1220.94 | 1153.89 -> 1219.32 | 77.05 -> 73.19 |
-| function_signature_change | 859.41 -> 861.07 | 1356.08 -> 1371.78 | 1118.73 -> 1191.29 | 80.35 -> 100.95 |
-| add_new_function | 848.67 -> 885.52 | 1401.82 -> 1220.52 | 1093.13 -> 1235.07 | 99.28 -> 70.53 |
-
-Scale curve: e2e build time (includes link where applicable):
-
-| LOC | Sengoo (ms) | C++ (ms) | Rust (ms) | Python (ms) |
-|---:|---:|---:|---:|---:|
-| 1000 | 867.76 | 1220.54 | 1201.87 | 80.53 |
-| 10000 | 1392.45 | 1250.38 | 1722.32 | 131.47 |
-| 100000 | 6146.46 | 1715.47 | 6263.89 | 774.08 |
-
-Link share:
-
-| LOC | Sengoo link share (%) | C++ link share (%) |
-|---:|---:|---:|
-| 1000 | 77.50 | 60.90 |
-| 10000 | 54.20 | 62.00 |
-| 100000 | 12.67 | 44.73 |
-
-Daemon on/off comparison (Sengoo real incremental, `--daemon-compare`):
-
-| Scenario | One-shot after (ms) | Daemon after (ms) | Delta (ms) |
-|---|---:|---:|---:|
-| loop_body_change | 822.61 | 900.70 | 78.09 |
-| function_signature_change | 861.07 | 849.27 | -11.80 |
-| add_new_function | 885.52 | 915.49 | 29.97 |
-
-Before/after deltas vs previous advanced report (`results/1771197260568-advanced-pipeline.json`):
-
-| Metric | Previous (ms) | Current (ms) | Delta (ms) |
-|---|---:|---:|---:|
-| loop_body_change after | 896.18 | 822.61 | -73.57 |
-| function_signature_change after | 898.27 | 861.07 | -37.20 |
-| add_new_function after | 893.82 | 885.52 | -8.30 |
-| 100k frontend | 922.19 | 933.12 | 10.94 |
-| 100k codegen | 4116.29 | 4434.77 | 318.47 |
-| 100k link | 730.10 | 778.57 | 48.47 |
-| 100k e2e | 5768.58 | 6146.46 | 377.88 |
-
-Advanced KPI gate (`python ./scripts/advanced-kpi-gate.py --mode soft --require-phase-deltas --require-daemon-comparison ...`) on this report:
-
-- real incremental target (`<= 200ms`): FAIL (all 3 scenarios above target)
-- 100k full build target (`<= 2000ms`): FAIL (`6146.46ms`)
-- 100k frontend target (`<= 300ms`): FAIL (`933.12ms`)
-- 100k codegen target (`<= 1500ms`): FAIL (`4434.77ms`)
-- 100k link target (`<= 500ms`): FAIL (`778.57ms`)
-
-### Legacy Cross-Language Suite
-
-Report:
-
-- `results/1771185060774-cross-language.json`
-
-Overall comparison table:
-
-| Metric | Sengoo | C++ | Rust | Python |
-|---|---:|---:|---:|---:|
-| Runtime p50 (ms) | 10.20 | 13.97 | 14.10 | 37.84 |
-| Full compile avg (ms) | 862.21 | 1467.46 | 981.09 | 71.65 |
-| Incremental before avg (ms) | 836.59 | 1798.03 | 1022.70 | 77.16 |
-| Incremental after avg (ms) | 50.60 | 1740.37 | 1147.47 | 68.99 |
-| Incremental reduction (%) | 93.95 | 3.21 | -12.20 | 10.59 |
-
-### Scenario Matrix (5 Scenarios)
-
-Report:
+Source reports:
 
 - `results/1771185238357-scenario-matrix.json`
+- `results/1771228834821-advanced-pipeline.json`
+- `results/1771230408116-python-interop.json`
+- `results/1771230417893-bootstrap-generality.json`
 
-Overall comparison table:
+Highlights:
 
-| Metric | Sengoo | C++ | Rust | Python |
-|---|---:|---:|---:|---:|
-| Runtime p50 avg (ms) | 8.92 | 8.55 | 8.59 | 45.14 |
-| Full compile avg (ms) | 835.92 | 1669.41 | 972.98 | 67.48 |
-| Incremental before avg (ms) | 841.96 | 1664.64 | 1039.68 | 67.25 |
-| Incremental after avg (ms) | 33.71 | 1702.23 | 1088.19 | 65.52 |
-| Incremental reduction avg (%) | 95.99 | -2.28 | -4.95 | 2.61 |
+- Scenario matrix incremental reduction avg:
+  - Sengoo: `95.99%`
+  - C++: `-2.28%`
+  - Rust: `-4.95%`
+  - Python: `2.61%`
+- Advanced pipeline 100k e2e (Sengoo): `967.10ms`
+- Python interop loop avg (ms):
+  - Python native: `2.184`
+  - Sengoo Runtime: `2.665`
+  - C++ CPython API: `2.919`
+  - Rust PyO3: `2.930`
+- Bootstrap proof: `pass` (`6/6` scenarios passed)
 
-Scenario-level runtime p50 (ms):
+## CI Gate Mapping
 
-| Scenario | Sengoo | C++ | Rust | Python |
-|---|---:|---:|---:|---:|
-| arith_loop | 12.56 | 8.65 | 8.38 | 44.36 |
-| branch_mix | 7.79 | 8.75 | 8.76 | 46.28 |
-| fn_call_hot | 7.71 | 8.13 | 7.87 | 45.04 |
-| array_index | 7.88 | 8.17 | 8.15 | 47.55 |
-| nested_loop | 8.67 | 9.04 | 9.78 | 42.49 |
+- `scripts/advanced-kpi-gate.py`
+  - enforces real incremental + scale + stage budgets
+- `scripts/interop-bootstrap-gate.py`
+  - enforces interop competitiveness + bootstrap generality pass
+- `scripts/e2e-smoke.sh` / `scripts/e2e-smoke.ps1`
+  - validates baseline compile pipeline behavior
 
-Scenario-level full compile avg (ms):
+Use `--mode hard` in CI to fail the workflow when thresholds are violated.
 
-| Scenario | Sengoo | C++ | Rust | Python |
-|---|---:|---:|---:|---:|
-| arith_loop | 846.67 | 1689.62 | 1008.01 | 67.38 |
-| branch_mix | 828.09 | 1662.31 | 960.43 | 62.47 |
-| fn_call_hot | 827.49 | 1647.67 | 969.11 | 72.84 |
-| array_index | 845.99 | 1674.86 | 949.25 | 65.60 |
-| nested_loop | 831.39 | 1672.59 | 978.11 | 69.11 |
+## Troubleshooting
 
-Scenario-level incremental reduction (%):
+- `cannot resolve Sengoo source root`
+  - set `SENGOO_ROOT` explicitly.
+- `clang++ not found`
+  - install LLVM/Clang or expect C++ runner to be skipped.
+- cargo network failures
+  - script will try offline build fallback when applicable.
+- large variance in local timings
+  - close background heavy processes and repeat with more samples.
 
-| Scenario | Sengoo | C++ | Rust | Python |
-|---|---:|---:|---:|---:|
-| arith_loop | 96.52 | -3.56 | -9.27 | 7.61 |
-| branch_mix | 94.39 | -2.72 | -12.92 | 0.36 |
-| fn_call_hot | 96.61 | -2.17 | -4.22 | 2.90 |
-| array_index | 96.22 | 0.64 | 0.79 | -3.47 |
-| nested_loop | 96.22 | -3.59 | 0.86 | 5.64 |
+---
 
-Notes:
+## 中文版
 
-- Runtime numbers are execution-only (compile excluded).
-- Incremental compile uses comment-only mutation for the second build.
-- Python compile numbers are bytecode compile path (`py_compile`), not native binary compile.
+# Sengoo Bench（中文说明）
 
-## SENGOO_ROOT
+这是 Sengoo 的独立基准与验证仓库，目标是让性能/正确性数据**可复现、可对比、可进 CI gate**。
 
-When this repository is not located inside Sengoo source tree, set:
+## 这个仓库能做什么
+
+- 四语言对比（Sengoo / C++ / Rust / Python）
+- 真实增量场景（改循环体、改函数签名、加新函数）
+- 规模曲线（1k / 10k / 100k LOC）
+- 链接占比与阶段拆分分析
+- Python 互操作基准（Sengoo Runtime / Rust PyO3 / C++ CPython API / Python 原生）
+- Bootstrap 通用性证明（多能力覆盖 + 正确性）
+- 软/硬门禁脚本（CI 可直接接入）
+- 端到端 smoke 脚本（工具链健康检查）
+
+## 目录结构
+
+```text
+bench/
+|-- scripts/                       # perf/e2e/gate 脚本
+|-- suites/                        # 基准套件资源
+|-- tests/                         # 示例与可直接运行脚本
+|   `-- python_interop_example.py  # Python 互操作直接示例（新增）
+|-- results/                       # 结果 JSON（git 忽略）
+|-- scenario_matrix_bench.py
+|-- advanced_pipeline_bench.py
+|-- python_interop_bench.py
+|-- bootstrap_generality_bench.py
+`-- README.md
+```
+
+## 依赖要求
+
+必需：
+
+- Python 3.10+
+- Rust 工具链（`cargo` / `rustc`）
+- 可访问 Sengoo 源码目录（通过 `SENGOO_ROOT` 或同级目录）
+
+建议（用于完整对比）：
+
+- LLVM/Clang（`clang` / `clang++`）
+- C++ 运行环境
+
+## clone 后如何复现
+
+### 推荐方式：同级目录
 
 ```bash
-export SENGOO_ROOT=/path/to/Sengoo
+cd /path/to/workspace
+git clone https://github.com/Hyper66666/Sengoo.git
+git clone https://github.com/Hyper66666/bench.git
+cd bench
+```
+
+PowerShell:
+
+```powershell
+Set-Location C:\path\to\workspace
+git clone https://github.com/Hyper66666/Sengoo.git
+git clone https://github.com/Hyper66666/bench.git
+Set-Location .\bench
+```
+
+### 非同级目录
+
+手动设置 `SENGOO_ROOT`：
+
+```bash
+export SENGOO_ROOT=/absolute/path/to/Sengoo
 ```
 
 ```powershell
-$env:SENGOO_ROOT = "C:\path\to\Sengoo"
+$env:SENGOO_ROOT = "C:\absolute\path\to\Sengoo"
 ```
 
-Then run scripts from this repository root.
+### 环境检查
+
+```bash
+python --version
+cargo --version
+clang --version
+```
+
+## 推荐测试流程
+
+### 1）先跑 smoke（快速确认环境）
+
+```bash
+bash ./scripts/e2e-smoke.sh
+```
+
+```powershell
+powershell -File .\scripts\e2e-smoke.ps1
+```
+
+### 2）运行新增 Python 互操作示例（可直接出结果）
+
+```bash
+python ./tests/python_interop_example.py
+```
+
+```powershell
+python .\tests\python_interop_example.py
+```
+
+快速参数：
+
+```bash
+python ./tests/python_interop_example.py --calls 3000 --samples 2 --warmup 0
+```
+
+该脚本会自动：
+
+- 调用 `python_interop_bench.py`
+- 识别本次生成的 JSON 报告路径
+- 输出精简结果表（`loop_avg_ms`、`calls_per_sec`、`vs_python_native_pct`）
+
+### 3）跑完整核心基准
+
+```bash
+python ./scenario_matrix_bench.py
+python ./advanced_pipeline_bench.py
+python ./python_interop_bench.py
+python ./bootstrap_generality_bench.py
+```
+
+### 4）执行 gate
+
+```bash
+python ./scripts/advanced-kpi-gate.py --mode soft --sample ./results/<advanced-report>.json
+python ./scripts/interop-bootstrap-gate.py --mode soft --interop-sample ./results/<python-interop-report>.json --bootstrap-sample ./results/<bootstrap-report>.json
+```
+
+## 结果怎么看
+
+输出都在 `results/`：
+
+- `*-scenario-matrix.json`：通用场景四语言矩阵
+- `*-advanced-pipeline.json`：真实增量 + 规模曲线 + 链接占比
+- `*-python-interop.json`：Python 边界开销与吞吐
+- `*-bootstrap-generality.json`：能力覆盖和正确性证明
+
+快速关注点：
+
+- 运行时：`runtime_p50_avg_ms`
+- 全量编译：`full_compile_avg_ms`
+- 增量收益：`incremental_reduction_avg_pct`
+- 100k 瓶颈：`scale_curve/100000/*`
+- 互操作边界：`summary/ordered_by_loop_avg_ms`
+
+## 最新快照（2026-02-16）
+
+对应文件：
+
+- `results/1771185238357-scenario-matrix.json`
+- `results/1771228834821-advanced-pipeline.json`
+- `results/1771230408116-python-interop.json`
+- `results/1771230417893-bootstrap-generality.json`
+
+关键数据：
+
+- 增量平均收益：Sengoo `95.99%`
+- 100k 端到端：Sengoo `967.10ms`
+- 互操作 loop 平均：Sengoo Runtime `2.665ms`
+- Bootstrap：`pass`（`6/6`）
+
+## 常见问题
+
+- `cannot resolve Sengoo source root`
+  - 设置 `SENGOO_ROOT`。
+- `clang++ not found`
+  - 安装 Clang，或接受 C++ runner 被跳过。
+- cargo 下载失败
+  - 脚本会尽量走 offline fallback。
+- 本地波动大
+  - 关闭高负载进程并增加采样次数。

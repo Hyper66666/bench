@@ -24,7 +24,7 @@ DEFAULT_REQUIRED_INCREMENTAL_SCENARIOS = (
     "function_signature_change",
     "add_new_function",
 )
-DEFAULT_REQUIRED_SCALE_LOCS = ("1000", "10000", "100000")
+DEFAULT_REQUIRED_SCALE_LOCS = ("1000", "10000", "100000", "1000000")
 
 
 def load_report(path: Path) -> dict[str, Any]:

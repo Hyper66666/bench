@@ -8,7 +8,7 @@ This repo is designed for one purpose: **measure performance and correctness tre
 
 - Cross-language performance matrix (Sengoo vs C++ vs Rust vs Python)
 - Real incremental compile scenarios (loop-body change, signature change, add function)
-- Scale curve (1k / 10k / 100k LOC)
+- Scale curve (1k / 10k / 100k / 1000k LOC)
 - Link-share and phase split analysis
 - Python interoperability benchmark (Sengoo Runtime / Rust PyO3 / C++ CPython API / Python native)
 - Non-invasive reflection benchmark (disabled vs enabled-unused vs enabled-used)
@@ -207,6 +207,7 @@ Quick interpretation checklist:
 - Compile throughput: compare `full_compile_avg_ms`
 - Incremental effectiveness: inspect `incremental_reduction_avg_pct`
 - 100k scale bottleneck: check `scale_curve/100000/*`
+- 1000k scale trend: check `scale_curve/1000000/*`
 - Python boundary cost: check `summary/ordered_by_loop_avg_ms`
 
 ## Latest Snapshot (Measured on February 16, 2026)
@@ -214,7 +215,7 @@ Quick interpretation checklist:
 Source reports:
 
 - `results/1771185238357-scenario-matrix.json`
-- `results/1771228834821-advanced-pipeline.json`
+- `results/1771246902505-advanced-pipeline.json`
 - `results/1771230408116-python-interop.json`
 - `results/1771230417893-bootstrap-generality.json`
 
@@ -225,7 +226,8 @@ Highlights:
   - C++: `-2.28%`
   - Rust: `-4.95%`
   - Python: `2.61%`
-- Advanced pipeline 100k e2e (Sengoo): `967.10ms`
+- Advanced pipeline 100k e2e (Sengoo): `1308.79ms`
+- Advanced pipeline 1000k e2e (Sengoo): `5885.34ms`
 - Python interop loop avg (ms):
   - Python native: `2.184`
   - Sengoo Runtime: `2.665`
@@ -267,7 +269,7 @@ Use `--mode hard` in CI to fail the workflow when thresholds are violated.
 
 - 四语言对比（Sengoo / C++ / Rust / Python）
 - 真实增量场景（改循环体、改函数签名、加新函数）
-- 规模曲线（1k / 10k / 100k LOC）
+- 规模曲线（1k / 10k / 100k / 1000k LOC）
 - 链接占比与阶段拆分分析
 - Python 互操作基准（Sengoo Runtime / Rust PyO3 / C++ CPython API / Python 原生）
 - Bootstrap 通用性证明（多能力覆盖 + 正确性）
@@ -408,6 +410,7 @@ python ./scripts/interop-bootstrap-gate.py --mode soft --interop-sample ./result
 - 全量编译：`full_compile_avg_ms`
 - 增量收益：`incremental_reduction_avg_pct`
 - 100k 瓶颈：`scale_curve/100000/*`
+- 1000k 趋势：`scale_curve/1000000/*`
 - 互操作边界：`summary/ordered_by_loop_avg_ms`
 
 ## 最新快照（2026-02-16）
@@ -415,14 +418,15 @@ python ./scripts/interop-bootstrap-gate.py --mode soft --interop-sample ./result
 对应文件：
 
 - `results/1771185238357-scenario-matrix.json`
-- `results/1771228834821-advanced-pipeline.json`
+- `results/1771246902505-advanced-pipeline.json`
 - `results/1771230408116-python-interop.json`
 - `results/1771230417893-bootstrap-generality.json`
 
 关键数据：
 
 - 增量平均收益：Sengoo `95.99%`
-- 100k 端到端：Sengoo `967.10ms`
+- 100k 端到端：Sengoo `1308.79ms`
+- 1000k 端到端：Sengoo `5885.34ms`
 - 互操作 loop 平均：Sengoo Runtime `2.665ms`
 - Bootstrap：`pass`（`6/6`）
 

@@ -44,6 +44,14 @@ TARGET_FRONTEND_100K_MS = 300.0
 TARGET_CODEGEN_100K_MS = 1500.0
 TARGET_LINK_100K_MS = 500.0
 DEFAULT_DAEMON_ADDR = "127.0.0.1:48768"
+MEMORY_LOC_BUCKETS = [10000, 100000, 1000000]
+MEMORY_ITERS_BY_LOC = {
+    10000: 3,
+    100000: 2,
+    1000000: 1,
+}
+MEMORY_SAMPLE_INTERVAL_S = 0.01
+BYTES_PER_MB = 1024.0 * 1024.0
 
 
 def now_unix_ms() -> int:
@@ -103,6 +111,179 @@ def measure_command_ms(
     started = time.perf_counter()
     run_checked(cmd, cwd=cwd, env=env)
     return (time.perf_counter() - started) * 1000.0
+
+
+def bytes_to_mb(value: int | float | None) -> float | None:
+    if value is None:
+        return None
+    return float(value) / BYTES_PER_MB
+
+
+def average_bytes_as_mb(values: list[int]) -> float | None:
+    if not values:
+        return None
+    return bytes_to_mb(int(sum(values) / len(values)))
+
+
+def percentile_bytes_as_mb(values: list[int], p: float) -> float | None:
+    if not values:
+        return None
+    pct = percentile([float(v) for v in values], p)
+    return bytes_to_mb(pct)
+
+
+def resolve_rustc_binary() -> str:
+    override = os.environ.get("RUSTC_REAL")
+    if override:
+        candidate = Path(override).expanduser().resolve()
+        if candidate.exists():
+            return str(candidate)
+
+    rustup = shutil.which("rustup")
+    if rustup:
+        proc = subprocess.run(
+            [rustup, "which", "rustc"],
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if proc.returncode == 0:
+            candidate = Path(proc.stdout.strip())
+            if candidate.exists():
+                return str(candidate)
+
+    return require_tool("rustc")
+
+
+def read_process_memory_bytes(pid: int) -> tuple[int | None, int | None]:
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return None, None
+
+        class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        PROCESS_VM_READ = 0x0010
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, False, pid)
+        if not handle:
+            return None, None
+        try:
+            counters = PROCESS_MEMORY_COUNTERS_EX()
+            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS_EX)
+            ok = psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+            if not ok:
+                return None, None
+            return int(counters.WorkingSetSize), int(counters.PrivateUsage)
+        finally:
+            kernel32.CloseHandle(handle)
+
+    status_path = Path("/proc") / str(pid) / "status"
+    if status_path.exists():
+        rss_bytes: int | None = None
+        private_bytes: int | None = None
+        try:
+            text = status_path.read_text(encoding="utf-8", errors="replace")
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        rss_bytes = int(parts[1]) * 1024
+                elif line.startswith("RssAnon:"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        private_bytes = int(parts[1]) * 1024
+            return rss_bytes, private_bytes
+        except OSError:
+            return None, None
+
+    ps = shutil.which("ps")
+    if not ps:
+        return None, None
+    proc = subprocess.run(
+        [ps, "-o", "rss=", "-p", str(pid)],
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        return None, None
+    try:
+        rss_kb = int(proc.stdout.strip())
+    except ValueError:
+        return None, None
+    return rss_kb * 1024, None
+
+
+def measure_command_peak_memory(
+    cmd: list[str],
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, float | None]:
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+
+    started = time.perf_counter()
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=merged_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+        errors="replace",
+    )
+    peak_rss = 0
+    peak_private = 0
+    saw_private = False
+
+    while True:
+        rss_bytes, private_bytes = read_process_memory_bytes(proc.pid)
+        if isinstance(rss_bytes, int) and rss_bytes > peak_rss:
+            peak_rss = rss_bytes
+        if isinstance(private_bytes, int):
+            saw_private = True
+            if private_bytes > peak_private:
+                peak_private = private_bytes
+
+        if proc.poll() is not None:
+            break
+        time.sleep(MEMORY_SAMPLE_INTERVAL_S)
+
+    stdout, stderr = proc.communicate()
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"command failed ({proc.returncode}): {' '.join(cmd)}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )
+
+    return {
+        "elapsed_ms": elapsed_ms,
+        "peak_rss_bytes": float(peak_rss) if peak_rss > 0 else None,
+        "peak_private_bytes": float(peak_private) if saw_private else None,
+    }
 
 
 def write_file(path: Path, content: str) -> None:
@@ -176,7 +357,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run advanced benchmark pipeline "
-            "(real incremental + scale curve + optional daemon comparison)."
+            "(real incremental + scale curve + compile-memory compare + optional daemon comparison)."
         )
     )
     parser.add_argument(
@@ -188,6 +369,11 @@ def parse_args() -> argparse.Namespace:
         "--daemon-addr",
         default=DEFAULT_DAEMON_ADDR,
         help=f"sgc daemon listen/connect address (default: {DEFAULT_DAEMON_ADDR})",
+    )
+    parser.add_argument(
+        "--skip-memory-compare",
+        action="store_true",
+        help="skip compile-memory comparison block",
     )
     return parser.parse_args()
 
@@ -1198,6 +1384,177 @@ edition = "2021"
     return results
 
 
+def measure_compile_memory_compare(
+    bench_root: Path,
+    sgc_bin: Path,
+    clangpp: str,
+    py: str,
+    sengoo_root: Path,
+    *,
+    sengoo_daemon_addr: str | None = None,
+) -> dict[str, Any]:
+    work = bench_root / ".advanced-work" / "compile-memory-compare"
+    clear_dir(work)
+    rustc = resolve_rustc_binary()
+
+    out: dict[str, Any] = {
+        "_meta": {
+            "loc_buckets": MEMORY_LOC_BUCKETS,
+            "iters_by_loc": MEMORY_ITERS_BY_LOC,
+            "sample_interval_ms": int(MEMORY_SAMPLE_INTERVAL_S * 1000),
+            "note": "peak_rss_mb_* is available on all platforms; peak_private_mb_* depends on OS support.",
+        }
+    }
+
+    for loc in MEMORY_LOC_BUCKETS:
+        loc_key = str(loc)
+        iters = MEMORY_ITERS_BY_LOC.get(loc, 1)
+        out[loc_key] = {}
+
+        # Sengoo (front-end compile only: emit LLVM IR).
+        sg_dir = work / "sengoo" / loc_key
+        clear_dir(sg_dir)
+        write_file(sg_dir / "main.sg", make_scale_source_sengoo(loc))
+        sg_elapsed: list[float] = []
+        sg_rss: list[int] = []
+        sg_private: list[int] = []
+        for _ in range(iters):
+            ll = sg_dir / "main.ll"
+            sample = measure_command_peak_memory(
+                sengoo_build_cmd(
+                    sgc_bin,
+                    sg_dir / "main.sg",
+                    2,
+                    True,
+                    emit_llvm=True,
+                    output=ll,
+                    daemon_addr=sengoo_daemon_addr,
+                ),
+                cwd=sengoo_root,
+            )
+            sg_elapsed.append(float(sample["elapsed_ms"] or 0.0))
+            if isinstance(sample["peak_rss_bytes"], float):
+                sg_rss.append(int(sample["peak_rss_bytes"]))
+            if isinstance(sample["peak_private_bytes"], float):
+                sg_private.append(int(sample["peak_private_bytes"]))
+        out[loc_key]["sengoo"] = {
+            "compile_avg_ms": average(sg_elapsed),
+            "peak_rss_mb_avg": average_bytes_as_mb(sg_rss),
+            "peak_rss_mb_p50": percentile_bytes_as_mb(sg_rss, 0.50),
+            "peak_private_mb_avg": average_bytes_as_mb(sg_private),
+            "peak_private_mb_p50": percentile_bytes_as_mb(sg_private, 0.50),
+            "iters": iters,
+            "compile_mode": "frontend_llvm_emit",
+        }
+
+        # C++ (compile only, PCH enabled).
+        cpp_dir = work / "cpp" / loc_key
+        clear_dir(cpp_dir)
+        write_file(
+            cpp_dir / "pch.hpp",
+            """#pragma once
+#include <array>
+#include <cstdint>
+#include <iostream>
+#include <string>
+#include <vector>
+""",
+        )
+        write_file(cpp_dir / "main.cpp", make_scale_source_cpp(loc))
+        build_cpp_pch(clangpp, cpp_dir)
+        cpp_elapsed: list[float] = []
+        cpp_rss: list[int] = []
+        cpp_private: list[int] = []
+        for _ in range(iters):
+            obj = cpp_dir / "main.obj"
+            sample = measure_command_peak_memory(
+                [
+                    clangpp,
+                    "-std=c++20",
+                    "-O2",
+                    "-include-pch",
+                    str(cpp_dir / "pch.hpp.pch"),
+                    "-c",
+                    str(cpp_dir / "main.cpp"),
+                    "-o",
+                    str(obj),
+                ],
+                cwd=cpp_dir,
+            )
+            cpp_elapsed.append(float(sample["elapsed_ms"] or 0.0))
+            if isinstance(sample["peak_rss_bytes"], float):
+                cpp_rss.append(int(sample["peak_rss_bytes"]))
+            if isinstance(sample["peak_private_bytes"], float):
+                cpp_private.append(int(sample["peak_private_bytes"]))
+        out[loc_key]["cpp"] = {
+            "compile_avg_ms": average(cpp_elapsed),
+            "peak_rss_mb_avg": average_bytes_as_mb(cpp_rss),
+            "peak_rss_mb_p50": percentile_bytes_as_mb(cpp_rss, 0.50),
+            "peak_private_mb_avg": average_bytes_as_mb(cpp_private),
+            "peak_private_mb_p50": percentile_bytes_as_mb(cpp_private, 0.50),
+            "iters": iters,
+            "fairness": {"pch_enabled": True},
+            "compile_mode": "compile_obj_only",
+        }
+
+        # Rust (direct rustc compile-to-object, bypass rustup shim when available).
+        rust_dir = work / "rust" / loc_key
+        clear_dir(rust_dir)
+        write_file(rust_dir / "main.rs", make_scale_source_rust(loc))
+        rust_elapsed: list[float] = []
+        rust_rss: list[int] = []
+        rust_private: list[int] = []
+        for _ in range(iters):
+            obj = rust_dir / "main.o"
+            sample = measure_command_peak_memory(
+                [rustc, "-O", "-Awarnings", "--emit=obj", str(rust_dir / "main.rs"), "-o", str(obj)],
+                cwd=rust_dir,
+            )
+            rust_elapsed.append(float(sample["elapsed_ms"] or 0.0))
+            if isinstance(sample["peak_rss_bytes"], float):
+                rust_rss.append(int(sample["peak_rss_bytes"]))
+            if isinstance(sample["peak_private_bytes"], float):
+                rust_private.append(int(sample["peak_private_bytes"]))
+        out[loc_key]["rust"] = {
+            "compile_avg_ms": average(rust_elapsed),
+            "peak_rss_mb_avg": average_bytes_as_mb(rust_rss),
+            "peak_rss_mb_p50": percentile_bytes_as_mb(rust_rss, 0.50),
+            "peak_private_mb_avg": average_bytes_as_mb(rust_private),
+            "peak_private_mb_p50": percentile_bytes_as_mb(rust_private, 0.50),
+            "iters": iters,
+            "fairness": {"rustc_direct": True},
+            "compile_mode": "compile_obj_only",
+        }
+
+        # Python (bytecode compile only).
+        py_dir = work / "python" / loc_key
+        clear_dir(py_dir)
+        write_file(py_dir / "main.py", make_scale_source_python(loc))
+        py_elapsed: list[float] = []
+        py_rss: list[int] = []
+        py_private: list[int] = []
+        for _ in range(iters):
+            clear_pycache(py_dir)
+            sample = measure_command_peak_memory([py, "-m", "py_compile", str(py_dir / "main.py")], cwd=py_dir)
+            py_elapsed.append(float(sample["elapsed_ms"] or 0.0))
+            if isinstance(sample["peak_rss_bytes"], float):
+                py_rss.append(int(sample["peak_rss_bytes"]))
+            if isinstance(sample["peak_private_bytes"], float):
+                py_private.append(int(sample["peak_private_bytes"]))
+        out[loc_key]["python"] = {
+            "compile_avg_ms": average(py_elapsed),
+            "peak_rss_mb_avg": average_bytes_as_mb(py_rss),
+            "peak_rss_mb_p50": percentile_bytes_as_mb(py_rss, 0.50),
+            "peak_private_mb_avg": average_bytes_as_mb(py_private),
+            "peak_private_mb_p50": percentile_bytes_as_mb(py_private, 0.50),
+            "iters": iters,
+            "compile_mode": "py_compile",
+            "note": "python benchmark has no native link stage",
+        }
+
+    return out
+
+
 def measure_reachability_matrix(
     bench_root: Path,
     sgc_bin: Path,
@@ -1318,6 +1675,62 @@ def print_scale_tables(scale_curve: dict[str, dict[str, Any]]) -> None:
         cpp_share = (cpp["link_avg_ms"] / cpp["e2e_avg_ms"] * 100.0) if cpp["e2e_avg_ms"] else 0.0
         print(f"| {loc_key} | {sg_share:.2f} | {cpp_share:.2f} |")
 
+    print("")
+    print("Frontend Share (Sengoo)")
+    print("| LOC | Frontend share (%) |")
+    print("|---:|---:|")
+    frontend_share_by_loc: dict[str, float] = {}
+    for loc_key in [str(x) for x in SCALE_LOC_BUCKETS]:
+        sg = scale_curve[loc_key]["sengoo"]
+        share = (
+            (float(sg["compile_frontend_llvm_avg_ms"]) / float(sg["e2e_avg_ms"]) * 100.0)
+            if sg["e2e_avg_ms"]
+            else 0.0
+        )
+        frontend_share_by_loc[loc_key] = share
+        print(f"| {loc_key} | {share:.2f} |")
+
+    share_100k = frontend_share_by_loc.get("100000", 0.0)
+    share_1000k = frontend_share_by_loc.get("1000000", 0.0)
+    delta_pp = share_1000k - share_100k
+    if delta_pp > 0.05:
+        trend = "increasing"
+    elif delta_pp < -0.05:
+        trend = "decreasing"
+    else:
+        trend = "stable"
+    print(
+        f"Frontend share trend 100k -> 1000k: {share_100k:.2f}% -> {share_1000k:.2f}% ({trend}, {delta_pp:+.2f}pp)"
+    )
+
+
+def print_compile_memory_compare(compile_memory_compare: dict[str, Any]) -> None:
+    print("")
+    print("Compile Peak Memory (RSS MB, lower is better)")
+    print("| LOC | Sengoo RSS | C++ RSS | Rust RSS | Python RSS |")
+    print("|---:|---:|---:|---:|---:|")
+    for loc_key in [str(x) for x in MEMORY_LOC_BUCKETS]:
+        loc_metrics = compile_memory_compare.get(loc_key, {})
+        row: list[str] = []
+        for lang in ("sengoo", "cpp", "rust", "python"):
+            lang_metrics = loc_metrics.get(lang, {})
+            rss = lang_metrics.get("peak_rss_mb_avg")
+            row.append("n/a" if rss is None else f"{float(rss):.2f}")
+        print(f"| {loc_key} | {' | '.join(row)} |")
+
+    print("")
+    print("Compile Peak Memory (private MB, when available)")
+    print("| LOC | Sengoo Private | C++ Private | Rust Private | Python Private |")
+    print("|---:|---:|---:|---:|---:|")
+    for loc_key in [str(x) for x in MEMORY_LOC_BUCKETS]:
+        loc_metrics = compile_memory_compare.get(loc_key, {})
+        row: list[str] = []
+        for lang in ("sengoo", "cpp", "rust", "python"):
+            lang_metrics = loc_metrics.get(lang, {})
+            private = lang_metrics.get("peak_private_mb_avg")
+            row.append("n/a" if private is None else f"{float(private):.2f}")
+        print(f"| {loc_key} | {' | '.join(row)} |")
+
 
 def print_reachability_matrix(reachability_matrix: dict[str, Any]) -> None:
     print("")
@@ -1368,9 +1781,24 @@ def compute_phase_deltas(
         }
 
     scale_100k = scale_curve.get("100000", {}).get("sengoo", {})
+    frontend_share_100k = float(scale.get("100000", {}).get("frontend_share_pct", 0.0) or 0.0)
+    frontend_share_1000k = float(scale.get("1000000", {}).get("frontend_share_pct", 0.0) or 0.0)
+    frontend_share_delta_pp = frontend_share_1000k - frontend_share_100k
+    if frontend_share_delta_pp > 0.05:
+        frontend_share_trend = "increasing"
+    elif frontend_share_delta_pp < -0.05:
+        frontend_share_trend = "decreasing"
+    else:
+        frontend_share_trend = "stable"
     return {
         "incremental_vs_target_ms": incremental,
         "scale_phase_share_pct": scale,
+        "frontend_share_trend_100k_to_1000k": {
+            "share_100k_pct": frontend_share_100k,
+            "share_1000k_pct": frontend_share_1000k,
+            "delta_pp": frontend_share_delta_pp,
+            "trend": frontend_share_trend,
+        },
         "scale_100k_vs_target_ms": {
             "frontend_minus_target_ms": float(scale_100k.get("compile_frontend_llvm_avg_ms", 0.0) or 0.0)
             - TARGET_FRONTEND_100K_MS,
@@ -1407,6 +1835,16 @@ def flatten_phase_snapshot(report: dict[str, Any]) -> dict[str, float]:
             value = sengoo_100k.get(key)
             if isinstance(value, (int, float)):
                 snapshot[f"scale_curve/100000/sengoo/{key}"] = float(value)
+        sengoo_1000k = scale_curve.get("1000000", {}).get("sengoo", {})
+        for key in (
+            "compile_frontend_llvm_avg_ms",
+            "codegen_obj_avg_ms",
+            "link_avg_ms",
+            "e2e_avg_ms",
+        ):
+            value = sengoo_1000k.get(key)
+            if isinstance(value, (int, float)):
+                snapshot[f"scale_curve/1000000/sengoo/{key}"] = float(value)
 
     reachability_matrix = report.get("reachability_matrix", {})
     if isinstance(reachability_matrix, dict):
@@ -1422,6 +1860,17 @@ def flatten_phase_snapshot(report: dict[str, Any]) -> dict[str, float]:
                 value = metrics.get(key)
                 if isinstance(value, (int, float)):
                     snapshot[f"reachability_matrix/{profile}/{key}"] = float(value)
+
+    compile_memory_compare = report.get("compile_memory_compare", {})
+    if isinstance(compile_memory_compare, dict):
+        for loc in [str(x) for x in MEMORY_LOC_BUCKETS]:
+            metrics = compile_memory_compare.get(loc, {}).get("sengoo", {})
+            if not isinstance(metrics, dict):
+                continue
+            for key in ("peak_rss_mb_avg", "peak_private_mb_avg"):
+                value = metrics.get(key)
+                if isinstance(value, (int, float)):
+                    snapshot[f"compile_memory_compare/{loc}/sengoo/{key}"] = float(value)
 
     return snapshot
 
@@ -1480,6 +1929,18 @@ def print_phase_delta_summary(phase_deltas: dict[str, Any]) -> None:
     ):
         value = float(scale_100k.get(key, 0.0) or 0.0)
         print(f"| 100k {key} | {value:.2f} |")
+    trend = phase_deltas.get("frontend_share_trend_100k_to_1000k", {})
+    if isinstance(trend, dict):
+        delta_pp = float(trend.get("delta_pp", 0.0) or 0.0)
+        share_100k = float(trend.get("share_100k_pct", 0.0) or 0.0)
+        share_1000k = float(trend.get("share_1000k_pct", 0.0) or 0.0)
+        trend_label = str(trend.get("trend", "unknown"))
+        print(
+            f"| frontend_share_100k_to_1000k | {delta_pp:.2f} |"
+        )
+        print(
+            f"frontend_share trend detail: 100k={share_100k:.2f}% 1000k={share_1000k:.2f}% ({trend_label})"
+        )
 
 
 def print_daemon_comparison(daemon_comparison: dict[str, Any]) -> None:
@@ -1517,6 +1978,15 @@ def main() -> int:
 
     real_incremental = measure_real_incremental(bench_root, sgc_bin, clangpp, cargo, py, sengoo_root)
     scale_curve = measure_scale_curve(bench_root, sgc_bin, clangpp, cargo, py, sengoo_root)
+    compile_memory_compare: dict[str, Any] | None = None
+    if not args.skip_memory_compare:
+        compile_memory_compare = measure_compile_memory_compare(
+            bench_root,
+            sgc_bin,
+            clangpp,
+            py,
+            sengoo_root,
+        )
     reachability_matrix = measure_reachability_matrix(bench_root, sgc_bin, clangpp, sengoo_root)
     phase_deltas = compute_phase_deltas(real_incremental, scale_curve)
 
@@ -1540,12 +2010,14 @@ def main() -> int:
             stop_sgc_daemon(daemon_proc)
 
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at_unix_ms": now_unix_ms(),
         "config": {
             "incremental_iterations": INCREMENTAL_ITERS,
             "scale_loc_buckets": SCALE_LOC_BUCKETS,
             "scale_iterations_by_loc": SCALE_ITERS_BY_LOC,
+            "memory_loc_buckets": MEMORY_LOC_BUCKETS,
+            "memory_iters_by_loc": MEMORY_ITERS_BY_LOC,
             "reachability_loc": REACHABILITY_LOC,
             "reachability_iters": REACHABILITY_ITERS,
             "reachability_profiles": REACHABILITY_PROFILES,
@@ -1553,6 +2025,7 @@ def main() -> int:
         "fairness": {
             "cpp": "precompiled header (PCH) enabled",
             "rust": "cargo incremental enabled (CARGO_INCREMENTAL=1)",
+            "memory_compare_rust": "direct rustc compile-to-object when rustup toolchain path is available",
         },
         "real_incremental": real_incremental,
         "scale_curve": scale_curve,
@@ -1562,9 +2035,12 @@ def main() -> int:
             "Scale curve e2e includes link time for compiled languages.",
             "Sengoo uses split timing: front-end LLVM emit + clang IR codegen + clang link.",
             "Rust uses cargo build e2e timing; split link-only timing is not isolated.",
+            "Compile-memory comparison tracks peak process RSS per compiler command.",
             "Reachability matrix validates optimization generality across all/half/entryless profiles.",
         ],
     }
+    if compile_memory_compare is not None:
+        report["compile_memory_compare"] = compile_memory_compare
     if daemon_comparison is not None:
         report["daemon_comparison"] = daemon_comparison
     if previous_report_path and previous_report_path.exists():
@@ -1581,6 +2057,8 @@ def main() -> int:
     print(f"Advanced bench report: {out_path}")
     print_incremental_tables(real_incremental)
     print_scale_tables(scale_curve)
+    if compile_memory_compare is not None:
+        print_compile_memory_compare(compile_memory_compare)
     print_reachability_matrix(reachability_matrix)
     print_phase_delta_summary(phase_deltas)
     if daemon_comparison is not None:

@@ -11,9 +11,12 @@ from typing import Any
 DEFAULT_MAX_REAL_INCREMENTAL_MS = 200.0
 DEFAULT_MAX_FULL_BUILD_100K_MS = 2000.0
 DEFAULT_MAX_FRONTEND_100K_MS = 300.0
+DEFAULT_MAX_FRONTEND_1000K_MS = 7000.0
 DEFAULT_MAX_CODEGEN_100K_MS = 1500.0
 DEFAULT_MAX_LINK_100K_MS = 500.0
 DEFAULT_MAX_DAEMON_REGRESSION_MS = 50.0
+DEFAULT_MAX_SENGOO_RSS_100K_MB = 300.0
+DEFAULT_MAX_SENGOO_RSS_1000K_MB = 1800.0
 DEFAULT_REQUIRED_REACHABILITY_PROFILES = (
     "all_reachable",
     "half_reachable",
@@ -25,6 +28,7 @@ DEFAULT_REQUIRED_INCREMENTAL_SCENARIOS = (
     "add_new_function",
 )
 DEFAULT_REQUIRED_SCALE_LOCS = ("1000", "10000", "100000", "1000000")
+DEFAULT_REQUIRED_MEMORY_LOCS = ("10000", "100000", "1000000")
 
 
 def load_report(path: Path) -> dict[str, Any]:
@@ -41,11 +45,15 @@ def evaluate_report(
     max_real_incremental_ms: float,
     max_full_build_100k_ms: float,
     max_frontend_100k_ms: float,
+    max_frontend_1000k_ms: float,
     max_codegen_100k_ms: float,
     max_link_100k_ms: float,
     max_daemon_regression_ms: float,
+    max_sengoo_rss_100k_mb: float,
+    max_sengoo_rss_1000k_mb: float,
     require_phase_deltas: bool,
     require_daemon_comparison: bool,
+    skip_memory_compare: bool,
     fail_fast: bool,
 ) -> tuple[list[str], list[str]]:
     summaries: list[str] = []
@@ -129,6 +137,16 @@ def evaluate_report(
                 if add_violation(f"missing scale_curve/{loc}/sengoo/link_avg_ms"):
                     return summaries, violations
 
+            if loc == "1000000" and isinstance(frontend_ms, (int, float)):
+                summaries.append(
+                    f"scale/1000000/frontend budget: {float(frontend_ms):.2f}ms target<={max_frontend_1000k_ms:.2f}ms"
+                )
+                if float(frontend_ms) > max_frontend_1000k_ms:
+                    if add_violation(
+                        f"scale/1000000 frontend exceeded target ({float(frontend_ms):.2f}ms > {max_frontend_1000k_ms:.2f}ms)"
+                    ):
+                        return summaries, violations
+
             if loc != "100000":
                 continue
 
@@ -174,6 +192,67 @@ def evaluate_report(
                         f"scale/100000 link exceeded target ({float(link_ms):.2f}ms > {max_link_100k_ms:.2f}ms)"
                     ):
                         return summaries, violations
+
+    if not skip_memory_compare:
+        compile_memory_compare = report.get("compile_memory_compare")
+        if not isinstance(compile_memory_compare, dict):
+            if add_violation("missing compile_memory_compare block"):
+                return summaries, violations
+        else:
+            for loc in DEFAULT_REQUIRED_MEMORY_LOCS:
+                loc_metrics = compile_memory_compare.get(loc)
+                if not isinstance(loc_metrics, dict):
+                    if add_violation(f"missing compile_memory_compare/{loc} block"):
+                        return summaries, violations
+                    continue
+
+                for lang in ("sengoo", "cpp", "rust", "python"):
+                    lang_metrics = loc_metrics.get(lang)
+                    if not isinstance(lang_metrics, dict):
+                        if add_violation(f"missing compile_memory_compare/{loc}/{lang} block"):
+                            return summaries, violations
+                        continue
+                    rss_mb = lang_metrics.get("peak_rss_mb_avg")
+                    if not isinstance(rss_mb, (int, float)):
+                        if add_violation(
+                            f"missing compile_memory_compare/{loc}/{lang}/peak_rss_mb_avg"
+                        ):
+                            return summaries, violations
+                        continue
+                    summaries.append(f"memory/{loc}/{lang}/rss: {float(rss_mb):.2f}MB")
+
+                sengoo_metrics = loc_metrics.get("sengoo", {})
+                if not isinstance(sengoo_metrics, dict):
+                    continue
+                sengoo_rss = sengoo_metrics.get("peak_rss_mb_avg")
+                if not isinstance(sengoo_rss, (int, float)):
+                    if add_violation(f"missing compile_memory_compare/{loc}/sengoo/peak_rss_mb_avg"):
+                        return summaries, violations
+                    continue
+
+                if loc == "100000":
+                    summaries.append(
+                        f"memory/100000/sengoo budget: {float(sengoo_rss):.2f}MB "
+                        f"target<={max_sengoo_rss_100k_mb:.2f}MB"
+                    )
+                    if float(sengoo_rss) > max_sengoo_rss_100k_mb:
+                        if add_violation(
+                            "compile_memory_compare/100000/sengoo peak RSS exceeded target "
+                            f"({float(sengoo_rss):.2f}MB > {max_sengoo_rss_100k_mb:.2f}MB)"
+                        ):
+                            return summaries, violations
+
+                if loc == "1000000":
+                    summaries.append(
+                        f"memory/1000000/sengoo budget: {float(sengoo_rss):.2f}MB "
+                        f"target<={max_sengoo_rss_1000k_mb:.2f}MB"
+                    )
+                    if float(sengoo_rss) > max_sengoo_rss_1000k_mb:
+                        if add_violation(
+                            "compile_memory_compare/1000000/sengoo peak RSS exceeded target "
+                            f"({float(sengoo_rss):.2f}MB > {max_sengoo_rss_1000k_mb:.2f}MB)"
+                        ):
+                            return summaries, violations
 
     if require_phase_deltas:
         phase_deltas = report.get("phase_deltas")
@@ -317,6 +396,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_FRONTEND_100K_MS,
     )
     parser.add_argument(
+        "--max-frontend-1000k-ms",
+        type=float,
+        default=DEFAULT_MAX_FRONTEND_1000K_MS,
+    )
+    parser.add_argument(
         "--max-codegen-100k-ms",
         type=float,
         default=DEFAULT_MAX_CODEGEN_100K_MS,
@@ -333,6 +417,16 @@ def parse_args() -> argparse.Namespace:
         help="maximum allowed daemon-after minus oneshot-after regression per scenario",
     )
     parser.add_argument(
+        "--max-sengoo-rss-100k-mb",
+        type=float,
+        default=DEFAULT_MAX_SENGOO_RSS_100K_MB,
+    )
+    parser.add_argument(
+        "--max-sengoo-rss-1000k-mb",
+        type=float,
+        default=DEFAULT_MAX_SENGOO_RSS_1000K_MB,
+    )
+    parser.add_argument(
         "--require-phase-deltas",
         action="store_true",
         help="require phase_deltas block in the report",
@@ -347,6 +441,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="stop evaluating after the first violation",
     )
+    parser.add_argument(
+        "--skip-memory-compare",
+        action="store_true",
+        help="skip compile_memory_compare validation",
+    )
     return parser.parse_args()
 
 
@@ -359,11 +458,15 @@ def main() -> int:
         max_real_incremental_ms=float(args.max_real_incremental_ms),
         max_full_build_100k_ms=float(args.max_full_build_100k_ms),
         max_frontend_100k_ms=float(args.max_frontend_100k_ms),
+        max_frontend_1000k_ms=float(args.max_frontend_1000k_ms),
         max_codegen_100k_ms=float(args.max_codegen_100k_ms),
         max_link_100k_ms=float(args.max_link_100k_ms),
         max_daemon_regression_ms=float(args.max_daemon_regression_ms),
+        max_sengoo_rss_100k_mb=float(args.max_sengoo_rss_100k_mb),
+        max_sengoo_rss_1000k_mb=float(args.max_sengoo_rss_1000k_mb),
         require_phase_deltas=bool(args.require_phase_deltas),
         require_daemon_comparison=bool(args.require_daemon_comparison),
+        skip_memory_compare=bool(args.skip_memory_compare),
         fail_fast=bool(args.fail_fast),
     )
 

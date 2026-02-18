@@ -7,6 +7,7 @@ BENCH_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MODE="soft"
 SAMPLE=""
 BASELINE="${BENCH_ROOT}/baseline.json"
+DECISION_OUT=""
 
 resolve_path() {
   local candidate="$1"
@@ -33,6 +34,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --baseline)
       BASELINE="${2:-}"
+      shift 2
+      ;;
+    --decision-out)
+      DECISION_OUT="${2:-}"
       shift 2
       ;;
     *)
@@ -62,11 +67,13 @@ if [[ ! -f "$BASELINE" ]]; then
   exit 2
 fi
 
-python3 - "$MODE" "$SAMPLE" "$BASELINE" <<'PY'
+python3 - "$MODE" "$SAMPLE" "$BASELINE" "$DECISION_OUT" <<'PY'
 import json
 import sys
+from pathlib import Path
 
 mode, sample_path, baseline_path = sys.argv[1], sys.argv[2], sys.argv[3]
+decision_out = sys.argv[4] if len(sys.argv) > 4 else ""
 
 with open(sample_path, "r", encoding="utf-8-sig") as f:
     report = json.load(f)
@@ -82,6 +89,7 @@ def fmt(v: float) -> str:
 checked = 0
 summaries = []
 violations = []
+comparisons = []
 
 kind = report.get("kind")
 suite = report.get("suite")
@@ -100,10 +108,28 @@ for case in report.get("cases", []):
             continue
         checked += 1
         improvement = ((prev - curr) / prev) * 100.0
+        delta_pct = ((curr - prev) / prev) * 100.0
+        passed = target is None or improvement >= float(target)
         summaries.append(
             f"runtime/{name}: improvement={fmt(improvement)}% target={fmt(float(target))}%"
         )
-        if target is not None and improvement < float(target):
+        comparisons.append(
+            {
+                "case_key": key,
+                "kind": kind,
+                "suite": suite,
+                "case": name,
+                "metric": "p50_ms",
+                "baseline": float(prev),
+                "measured": float(curr),
+                "delta_pct": delta_pct,
+                "objective": "improvement_pct",
+                "objective_pct": improvement,
+                "target_pct": None if target is None else float(target),
+                "pass": passed,
+            }
+        )
+        if target is not None and not passed:
             violations.append(
                 f"runtime/{name} below target ({fmt(improvement)}% < {fmt(float(target))}%)"
             )
@@ -118,10 +144,28 @@ for case in report.get("cases", []):
             continue
         checked += 1
         reduction = ((prev - curr) / prev) * 100.0
+        delta_pct = ((curr - prev) / prev) * 100.0
+        passed = target is None or reduction >= float(target)
         summaries.append(
             f"compile/{name}: reduction={fmt(reduction)}% target={fmt(float(target))}%"
         )
-        if target is not None and reduction < float(target):
+        comparisons.append(
+            {
+                "case_key": key,
+                "kind": kind,
+                "suite": suite,
+                "case": name,
+                "metric": "total_ms",
+                "baseline": float(prev),
+                "measured": float(curr),
+                "delta_pct": delta_pct,
+                "objective": "reduction_pct",
+                "objective_pct": reduction,
+                "target_pct": None if target is None else float(target),
+                "pass": passed,
+            }
+        )
+        if target is not None and not passed:
             violations.append(
                 f"compile/{name} below target ({fmt(reduction)}% < {fmt(float(target))}%)"
             )
@@ -134,10 +178,28 @@ for case in report.get("cases", []):
             continue
         checked += 1
         reduction = ((before - after) / before) * 100.0
+        delta_pct = ((after - before) / before) * 100.0
+        passed = target is None or reduction >= float(target)
         summaries.append(
             f"incremental/{name}: reduction={fmt(reduction)}% target={fmt(float(target))}%"
         )
-        if target is not None and reduction < float(target):
+        comparisons.append(
+            {
+                "case_key": key,
+                "kind": kind,
+                "suite": suite,
+                "case": name,
+                "metric": "after_ms",
+                "baseline": float(before),
+                "measured": float(after),
+                "delta_pct": delta_pct,
+                "objective": "reduction_pct",
+                "objective_pct": reduction,
+                "target_pct": None if target is None else float(target),
+                "pass": passed,
+            }
+        )
+        if target is not None and not passed:
             violations.append(
                 f"incremental/{name} below target ({fmt(reduction)}% < {fmt(float(target))}%)"
             )
@@ -149,6 +211,26 @@ if checked == 0:
 print(f"perf-gate mode={mode} sample={sample_path} baseline={baseline_path}")
 for line in summaries:
     print(f"  - {line}")
+
+decision_payload = {
+    "schema_version": 1,
+    "mode": mode,
+    "sample": str(Path(sample_path).resolve()),
+    "baseline": str(Path(baseline_path).resolve()),
+    "kind": kind,
+    "suite": suite,
+    "comparisons": comparisons,
+    "violations": violations,
+    "gate_decision": "pass" if not violations else "fail",
+}
+if decision_out:
+    decision_path = Path(decision_out).resolve()
+else:
+    decision_path = Path(sample_path).resolve().with_name(
+        f"{Path(sample_path).stem}-perf-gate.json"
+    )
+decision_path.write_text(json.dumps(decision_payload, indent=2), encoding="utf-8")
+print(f"  decision-artifact={decision_path}")
 
 if not violations:
     print("perf-gate PASS")

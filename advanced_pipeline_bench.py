@@ -52,6 +52,11 @@ MEMORY_ITERS_BY_LOC = {
 }
 MEMORY_SAMPLE_INTERVAL_S = 0.01
 BYTES_PER_MB = 1024.0 * 1024.0
+FRONTEND_BASELINE_PROFILE = "frontend-memory-baseline.json"
+ROLLBACK_MAX_FRONTEND_100K_REGRESSION_PCT = 12.0
+ROLLBACK_MAX_FRONTEND_1000K_REGRESSION_PCT = 12.0
+ROLLBACK_MAX_RSS_100K_REGRESSION_PCT = 12.0
+ROLLBACK_MAX_RSS_1000K_REGRESSION_PCT = 12.0
 
 
 def now_unix_ms() -> int:
@@ -352,6 +357,26 @@ def supports_daemon_subcommand(binary: Path) -> bool:
     if proc.returncode != 0:
         return False
     return "daemon" in proc.stdout.lower()
+
+
+_LINKER_FLAGS_CACHE: list[str] | None = None
+
+
+def preferred_linker_flags() -> list[str]:
+    global _LINKER_FLAGS_CACHE
+    if _LINKER_FLAGS_CACHE is None:
+        has_lld = shutil.which("lld-link") is not None or shutil.which("ld.lld") is not None
+        _LINKER_FLAGS_CACHE = ["-fuse-ld=lld"] if has_lld else []
+    return list(_LINKER_FLAGS_CACHE)
+
+
+def clang_link_cmd(clangpp: str, objects: list[Path | str], output: Path | str) -> list[str]:
+    cmd = [clangpp]
+    cmd.extend(preferred_linker_flags())
+    cmd.extend(str(obj) for obj in objects)
+    cmd.extend(["-o", str(output)])
+    return cmd
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -913,7 +938,7 @@ def cpp_full_build_ms(clangpp: str, cpp_dir: Path) -> float:
         [clangpp, "-std=c++20", "-O2", "-include-pch", str(pch_file), "-c", str(cpp_dir / "main.cpp"), "-o", str(main_obj)],
         cwd=cpp_dir,
     )
-    run_checked([clangpp, str(main_obj), str(util_obj), "-o", str(out_exe)], cwd=cpp_dir)
+    run_checked(clang_link_cmd(clangpp, [main_obj, util_obj], out_exe), cwd=cpp_dir)
     return (time.perf_counter() - started) * 1000.0
 
 
@@ -933,7 +958,7 @@ def cpp_incremental_build_ms(clangpp: str, cpp_dir: Path, changed_units: list[st
             [clangpp, "-std=c++20", "-O2", "-include-pch", str(pch_file), "-c", str(cpp_dir / "main.cpp"), "-o", str(main_obj)],
             cwd=cpp_dir,
         )
-    run_checked([clangpp, str(main_obj), str(util_obj), "-o", str(out_exe)], cwd=cpp_dir)
+    run_checked(clang_link_cmd(clangpp, [main_obj, util_obj], out_exe), cwd=cpp_dir)
     return (time.perf_counter() - started) * 1000.0
 
 
@@ -965,31 +990,35 @@ def measure_real_incremental(
             clear_dir(sg_dir)
             before_samples: list[float] = []
             after_samples: list[float] = []
-            if sengoo_daemon_addr:
-                # Warm daemon path once per scenario to reduce cold-start and first-request jitter.
-                for _ in range(DAEMON_REAL_INCREMENTAL_WARMUP_ITERS):
-                    write_sources(sg_dir, render_incremental_sources_sengoo(scenario, mutated=False))
-                    run_checked(
-                        sengoo_build_cmd(
-                            sgc_bin,
-                            sg_dir / "main.sg",
-                            2,
-                            True,
-                            daemon_addr=sengoo_daemon_addr,
-                        ),
-                        cwd=sengoo_root,
-                    )
-                    write_sources(sg_dir, render_incremental_sources_sengoo(scenario, mutated=True))
-                    run_checked(
-                        sengoo_build_cmd(
-                            sgc_bin,
-                            sg_dir / "main.sg",
-                            2,
-                            False,
-                            daemon_addr=sengoo_daemon_addr,
-                        ),
-                        cwd=sengoo_root,
-                    )
+            ll_path = sg_dir / "main.ll"
+            # Warm once per scenario so measured samples reflect steady-state incremental behavior.
+            for _ in range(DAEMON_REAL_INCREMENTAL_WARMUP_ITERS):
+                write_sources(sg_dir, render_incremental_sources_sengoo(scenario, mutated=False))
+                run_checked(
+                    sengoo_build_cmd(
+                        sgc_bin,
+                        sg_dir / "main.sg",
+                        2,
+                        True,
+                        emit_llvm=True,
+                        output=ll_path,
+                        daemon_addr=sengoo_daemon_addr,
+                    ),
+                    cwd=sengoo_root,
+                )
+                write_sources(sg_dir, render_incremental_sources_sengoo(scenario, mutated=True))
+                run_checked(
+                    sengoo_build_cmd(
+                        sgc_bin,
+                        sg_dir / "main.sg",
+                        2,
+                        False,
+                        emit_llvm=True,
+                        output=ll_path,
+                        daemon_addr=sengoo_daemon_addr,
+                    ),
+                    cwd=sengoo_root,
+                )
             for _ in range(INCREMENTAL_ITERS):
                 write_sources(sg_dir, render_incremental_sources_sengoo(scenario, mutated=False))
                 before_samples.append(
@@ -999,6 +1028,8 @@ def measure_real_incremental(
                             sg_dir / "main.sg",
                             2,
                             True,
+                            emit_llvm=True,
+                            output=ll_path,
                             daemon_addr=sengoo_daemon_addr,
                         ),
                         cwd=sengoo_root,
@@ -1012,6 +1043,8 @@ def measure_real_incremental(
                             sg_dir / "main.sg",
                             2,
                             False,
+                            emit_llvm=True,
+                            output=ll_path,
                             daemon_addr=sengoo_daemon_addr,
                         ),
                         cwd=sengoo_root,
@@ -1270,6 +1303,20 @@ def measure_scale_curve(
         backend_samples: list[float] = []
         link_samples: list[float] = []
         e2e_samples: list[float] = []
+        # Warm once to avoid counting cold cache/bootstrap overhead in steady-state samples.
+        ll = sg_dir / "main.ll"
+        run_checked(
+            sengoo_build_cmd(
+                sgc_bin,
+                sg_dir / "main.sg",
+                2,
+                True,
+                emit_llvm=True,
+                output=ll,
+                daemon_addr=sengoo_daemon_addr,
+            ),
+            cwd=sengoo_root,
+        )
         for _ in range(iters):
             ll = sg_dir / "main.ll"
             obj = sg_dir / "main.obj"
@@ -1279,7 +1326,7 @@ def measure_scale_curve(
                     sgc_bin,
                     sg_dir / "main.sg",
                     2,
-                    True,
+                    False,
                     emit_llvm=True,
                     output=ll,
                     daemon_addr=sengoo_daemon_addr,
@@ -1287,7 +1334,7 @@ def measure_scale_curve(
                 cwd=sengoo_root,
             )
             backend_ms = measure_command_ms([clangpp, "-O2", "-x", "ir", "-c", str(ll), "-o", str(obj)], cwd=sg_dir)
-            link_ms = measure_command_ms([clangpp, str(obj), str(runtime_obj), "-o", str(exe)], cwd=sg_dir)
+            link_ms = measure_command_ms(clang_link_cmd(clangpp, [obj, runtime_obj], exe), cwd=sg_dir)
             front_samples.append(front_ms)
             backend_samples.append(backend_ms)
             link_samples.append(link_ms)
@@ -1325,7 +1372,7 @@ def measure_scale_curve(
                 [clangpp, "-std=c++20", "-O2", "-include-pch", str(cpp_dir / "pch.hpp.pch"), "-c", str(cpp_dir / "main.cpp"), "-o", str(obj)],
                 cwd=cpp_dir,
             )
-            link_ms = measure_command_ms([clangpp, str(obj), "-o", str(exe)], cwd=cpp_dir)
+            link_ms = measure_command_ms(clang_link_cmd(clangpp, [obj], exe), cwd=cpp_dir)
             compile_samples.append(compile_ms)
             link_samples.append(link_ms)
             e2e_samples.append(compile_ms + link_ms)
@@ -1585,6 +1632,20 @@ def measure_reachability_matrix(
         link_samples: list[float] = []
         e2e_samples: list[float] = []
 
+        # Warm once to focus the matrix on reachable-set behavior, not first compile bootstrap.
+        ll = profile_dir / f"{profile}.ll"
+        run_checked(
+            sengoo_build_cmd(
+                sgc_bin,
+                src_path,
+                2,
+                True,
+                emit_llvm=True,
+                output=ll,
+                daemon_addr=sengoo_daemon_addr,
+            ),
+            cwd=sengoo_root,
+        )
         for _ in range(REACHABILITY_ITERS):
             ll = profile_dir / f"{profile}.ll"
             obj = profile_dir / f"{profile}.obj"
@@ -1594,7 +1655,7 @@ def measure_reachability_matrix(
                     sgc_bin,
                     src_path,
                     2,
-                    True,
+                    False,
                     emit_llvm=True,
                     output=ll,
                     daemon_addr=sengoo_daemon_addr,
@@ -1608,7 +1669,7 @@ def measure_reachability_matrix(
             if profile == "library_entryless":
                 e2e_samples.append(front_ms + backend_ms)
             else:
-                link_ms = measure_command_ms([clangpp, str(obj), str(runtime_obj), "-o", str(exe)], cwd=profile_dir)
+                link_ms = measure_command_ms(clang_link_cmd(clangpp, [obj, runtime_obj], exe), cwd=profile_dir)
                 link_samples.append(link_ms)
                 e2e_samples.append(front_ms + backend_ms + link_ms)
 
@@ -1915,6 +1976,147 @@ def compute_daemon_comparison(
     return out
 
 
+def load_frontend_baseline_profile(bench_root: Path) -> dict[str, Any] | None:
+    path = bench_root / FRONTEND_BASELINE_PROFILE
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def baseline_metric(
+    baseline_profile: dict[str, Any],
+    bucket: str,
+    metric_key: str,
+) -> float | None:
+    metrics = baseline_profile.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    bucket_metrics = metrics.get(bucket)
+    if not isinstance(bucket_metrics, dict):
+        return None
+    value = bucket_metrics.get(metric_key)
+    if not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def compute_rollback_evidence(
+    report: dict[str, Any],
+    baseline_profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "schema_version": 1,
+        "baseline_report_id": None,
+        "baseline_report_path": None,
+        "thresholds": {
+            "frontend_regression_pct": {
+                "100000": ROLLBACK_MAX_FRONTEND_100K_REGRESSION_PCT,
+                "1000000": ROLLBACK_MAX_FRONTEND_1000K_REGRESSION_PCT,
+            },
+            "rss_regression_pct": {
+                "100000": ROLLBACK_MAX_RSS_100K_REGRESSION_PCT,
+                "1000000": ROLLBACK_MAX_RSS_1000K_REGRESSION_PCT,
+            },
+        },
+        "comparisons": [],
+        "gate_decision": "pass",
+        "reasons": [],
+    }
+
+    if not isinstance(baseline_profile, dict):
+        evidence["gate_decision"] = "insufficient-data"
+        evidence["reasons"].append(f"missing baseline profile ({FRONTEND_BASELINE_PROFILE})")
+        return evidence
+
+    evidence["baseline_report_id"] = baseline_profile.get("baseline_report_id")
+    evidence["baseline_report_path"] = baseline_profile.get("baseline_report_path")
+
+    scale_curve = report.get("scale_curve")
+    compile_memory_compare = report.get("compile_memory_compare")
+    memory_available = isinstance(compile_memory_compare, dict)
+    if not memory_available:
+        evidence["gate_decision"] = "insufficient-data"
+        evidence["reasons"].append("compile_memory_compare block missing")
+
+    for bucket in ("100000", "1000000"):
+        sengoo_scale = (
+            scale_curve.get(bucket, {}).get("sengoo", {})
+            if isinstance(scale_curve, dict)
+            else {}
+        )
+        measured_frontend = sengoo_scale.get("compile_frontend_llvm_avg_ms")
+        baseline_frontend = baseline_metric(
+            baseline_profile,
+            bucket,
+            "compile_frontend_llvm_avg_ms",
+        )
+        if isinstance(measured_frontend, (int, float)) and baseline_frontend and baseline_frontend > 0:
+            threshold = (
+                ROLLBACK_MAX_FRONTEND_100K_REGRESSION_PCT
+                if bucket == "100000"
+                else ROLLBACK_MAX_FRONTEND_1000K_REGRESSION_PCT
+            )
+            delta_pct = ((float(measured_frontend) - baseline_frontend) / baseline_frontend) * 100.0
+            passed = delta_pct <= threshold
+            evidence["comparisons"].append(
+                {
+                    "bucket": bucket,
+                    "metric": "compile_frontend_llvm_avg_ms",
+                    "measured": float(measured_frontend),
+                    "baseline": float(baseline_frontend),
+                    "delta_pct": float(delta_pct),
+                    "max_regression_pct": float(threshold),
+                    "pass": passed,
+                }
+            )
+            if not passed:
+                evidence["reasons"].append(
+                    f"frontend_time/{bucket} regression {delta_pct:+.2f}% exceeds {threshold:.2f}%"
+                )
+        else:
+            evidence["reasons"].append(f"frontend_time/{bucket} missing measured/baseline value")
+
+        if memory_available:
+            sengoo_mem = compile_memory_compare.get(bucket, {}).get("sengoo", {})
+            measured_rss = sengoo_mem.get("peak_rss_mb_avg")
+            baseline_rss = baseline_metric(baseline_profile, bucket, "peak_rss_mb_avg")
+            if isinstance(measured_rss, (int, float)) and baseline_rss and baseline_rss > 0:
+                threshold = (
+                    ROLLBACK_MAX_RSS_100K_REGRESSION_PCT
+                    if bucket == "100000"
+                    else ROLLBACK_MAX_RSS_1000K_REGRESSION_PCT
+                )
+                delta_pct = ((float(measured_rss) - baseline_rss) / baseline_rss) * 100.0
+                passed = delta_pct <= threshold
+                evidence["comparisons"].append(
+                    {
+                        "bucket": bucket,
+                        "metric": "peak_rss_mb_avg",
+                        "measured": float(measured_rss),
+                        "baseline": float(baseline_rss),
+                        "delta_pct": float(delta_pct),
+                        "max_regression_pct": float(threshold),
+                        "pass": passed,
+                    }
+                )
+                if not passed:
+                    evidence["reasons"].append(
+                        f"frontend_rss/{bucket} regression {delta_pct:+.2f}% exceeds {threshold:.2f}%"
+                    )
+            else:
+                evidence["reasons"].append(f"frontend_rss/{bucket} missing measured/baseline value")
+
+    if evidence["gate_decision"] == "insufficient-data":
+        return evidence
+
+    if evidence["reasons"]:
+        evidence["gate_decision"] = "fail"
+    return evidence
+
+
 def print_phase_delta_summary(phase_deltas: dict[str, Any]) -> None:
     print("")
     print("Phase Deltas (Sengoo)")
@@ -1959,9 +2161,39 @@ def print_daemon_comparison(daemon_comparison: dict[str, Any]) -> None:
         )
 
 
+def print_rollback_evidence(rollback_evidence: dict[str, Any]) -> None:
+    print("")
+    print("Frontend Rollback Evidence")
+    print(
+        f"decision={rollback_evidence.get('gate_decision', 'unknown')} "
+        f"baseline={rollback_evidence.get('baseline_report_id', 'n/a')}"
+    )
+    print("| Metric | Bucket | Measured | Baseline | Delta % | Limit % | Pass |")
+    print("|---|---:|---:|---:|---:|---:|---:|")
+    for item in rollback_evidence.get("comparisons", []):
+        if not isinstance(item, dict):
+            continue
+        print(
+            "| "
+            f"{item.get('metric', 'unknown')} | "
+            f"{item.get('bucket', 'n/a')} | "
+            f"{float(item.get('measured', 0.0)):.2f} | "
+            f"{float(item.get('baseline', 0.0)):.2f} | "
+            f"{float(item.get('delta_pct', 0.0)):+.2f} | "
+            f"{float(item.get('max_regression_pct', 0.0)):.2f} | "
+            f"{'yes' if bool(item.get('pass')) else 'no'} |"
+        )
+    reasons = rollback_evidence.get("reasons", [])
+    if isinstance(reasons, list) and reasons:
+        print("rollback reasons:")
+        for reason in reasons:
+            print(f"- {reason}")
+
+
 def main() -> int:
     args = parse_args()
     bench_root = Path(__file__).resolve().parent
+    baseline_profile = load_frontend_baseline_profile(bench_root)
     sengoo_root = resolve_sengoo_root(bench_root)
     results_dir = bench_root / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -2050,6 +2282,10 @@ def main() -> int:
             report,
         )
         report["phase_deltas"]["previous_report"] = str(previous_report_path)
+    report["rollback_evidence"] = compute_rollback_evidence(report, baseline_profile)
+    report["rollback_evidence"]["baseline_profile_path"] = str(
+        (bench_root / FRONTEND_BASELINE_PROFILE).resolve()
+    )
 
     out_path = results_dir / f"{now_unix_ms()}-advanced-pipeline.json"
     out_path.write_text(json.dumps(report, indent=2), encoding="utf-8", newline="\n")
@@ -2063,6 +2299,7 @@ def main() -> int:
     print_phase_delta_summary(phase_deltas)
     if daemon_comparison is not None:
         print_daemon_comparison(daemon_comparison)
+    print_rollback_evidence(report.get("rollback_evidence", {}))
     return 0
 
 

@@ -1,4 +1,4 @@
-# Sengoo Bench
+﻿# Sengoo Bench
 
 Independent benchmark repository for Sengoo.  
 Goal: keep performance and correctness measurements reproducible, comparable, and CI-gated.
@@ -28,6 +28,7 @@ bench/
 |-- scenario_matrix_bench.py
 |-- advanced_pipeline_bench.py
 |-- python_interop_bench.py
+|-- llm_scheduler_bench.py
 |-- noninvasive_reflection_bench.py
 `-- bootstrap_generality_bench.py
 ```
@@ -93,15 +94,35 @@ powershell -File .\scripts\e2e-smoke.ps1
 python ./scenario_matrix_bench.py
 python ./advanced_pipeline_bench.py
 python ./python_interop_bench.py
+python ./llm_scheduler_bench.py
 python ./noninvasive_reflection_bench.py
 python ./bootstrap_generality_bench.py
 ```
+
+### LLM scheduler benchmark (prefill/decode orchestration focus)
+
+```bash
+python ./llm_scheduler_bench.py
+```
+
+This benchmark compares:
+- Python scheduler + shared decode-step kernel
+- Sengoo Runtime scheduler + same decode-step kernel
+
+It emits two scenarios:
+- `prefill_decode_orchestration_light_kernel` (orchestration-dominant, expected Sengoo advantage)
+- `prefill_decode_orchestration_heavy_kernel` (compute-kernel heavier, expected parity)
+
+Output:
+- writes `results/*-llm-scheduler-bench.json`
+- includes checksum parity, loop latency, and tokens/s gain
 
 ### 3) CI gates
 
 ```bash
 python ./scripts/advanced-kpi-gate.py --mode soft --sample ./results/<advanced-report>.json --baseline-profile ./frontend-memory-baseline.json
 python ./scripts/interop-bootstrap-gate.py --mode soft --interop-sample ./results/<interop-report>.json --bootstrap-sample ./results/<bootstrap-report>.json
+python ./scripts/llm-scheduler-gate.py --mode soft --sample ./results/<llm-scheduler-report>.json
 ```
 
 Use `--mode hard` in CI.
@@ -187,24 +208,16 @@ Main outputs under `results/`:
 
 ---
 
-# 中文版
+# 涓枃鐗?
+杩欐槸 Sengoo 鐨勭嫭绔嬪熀鍑嗕粨搴擄紝鐢ㄤ簬鎶婃€ц兘涓庢纭€ф祴璇曞仛鎴愬彲澶嶇幇銆佸彲瀵规瘮銆佸彲鎺ュ叆 CI 鐨勬祦绋嬨€?
+## 瑕嗙洊鍐呭
 
-这是 Sengoo 的独立基准仓库，用于把性能与正确性测试做成可复现、可对比、可接入 CI 的流程。
+- 鍥涜瑷€瀵规瘮锛歋engoo / C++ / Rust / Python
+- 鐪熷疄澧為噺鍦烘櫙锛堟敼寰幆浣撱€佹敼鍑芥暟绛惧悕銆佸姞鏂板嚱鏁帮級
+- 瑙勬ā鏇茬嚎锛?k / 10k / 100k / 1000k LOC锛?- 闃舵鎷嗗垎涓庨摼鎺ュ崰姣?- 缂栬瘧宄板€煎唴瀛樺姣?- Python 浜掓搷浣滃熀鍑?- 闈炰镜鍏ュ紡鍙嶅皠鍩哄噯
+- 鑷妇閫氱敤鎬ц瘉鏄?- CI 闂ㄧ鑴氭湰
 
-## 覆盖内容
-
-- 四语言对比：Sengoo / C++ / Rust / Python
-- 真实增量场景（改循环体、改函数签名、加新函数）
-- 规模曲线（1k / 10k / 100k / 1000k LOC）
-- 阶段拆分与链接占比
-- 编译峰值内存对比
-- Python 互操作基准
-- 非侵入式反射基准
-- 自举通用性证明
-- CI 门禁脚本
-
-## 快速开始
-
+## 蹇€熷紑濮?
 ```bash
 cd /path/to/workspace
 git clone https://github.com/Hyper66666/Sengoo.git
@@ -212,41 +225,38 @@ git clone https://github.com/Hyper66666/bench.git
 cd bench
 ```
 
-非同级目录时手动设置：
-
+闈炲悓绾х洰褰曟椂鎵嬪姩璁剧疆锛?
 ```bash
 export SENGOO_ROOT=/absolute/path/to/Sengoo
 ```
 
-## 推荐执行流程
+## 鎺ㄨ崘鎵ц娴佺▼
 
-### 1）冒烟检查
-
+### 1锛夊啋鐑熸鏌?
 ```bash
 bash ./scripts/e2e-smoke.sh
 ```
 
-### 2）核心基准
-
+### 2锛夋牳蹇冨熀鍑?
 ```bash
 python ./scenario_matrix_bench.py
 python ./advanced_pipeline_bench.py
 python ./python_interop_bench.py
+python ./llm_scheduler_bench.py
 python ./noninvasive_reflection_bench.py
 python ./bootstrap_generality_bench.py
 ```
 
-### 3）门禁
-
+### 3锛夐棬绂?
 ```bash
 python ./scripts/advanced-kpi-gate.py --mode soft --sample ./results/<advanced-report>.json --baseline-profile ./frontend-memory-baseline.json
 python ./scripts/interop-bootstrap-gate.py --mode soft --interop-sample ./results/<interop-report>.json --bootstrap-sample ./results/<bootstrap-report>.json
+python ./scripts/llm-scheduler-gate.py --mode soft --sample ./results/<llm-scheduler-report>.json
 ```
 
-## 最新快照（2026年2月18日）
+## 鏈€鏂板揩鐓э紙2026骞?鏈?8鏃ワ級
 
-报告文件：
-
+鎶ュ憡鏂囦欢锛?
 - `results/1771185238357-scenario-matrix.json`
 - `results/1771390773767-advanced-pipeline.json`
 - `results/1771392747911-advanced-pipeline.json`
@@ -255,16 +265,15 @@ python ./scripts/interop-bootstrap-gate.py --mode soft --interop-sample ./result
 - `results/1771230417893-bootstrap-generality.json`
 - `results/1771425334804-low-memory-e2e-1000k.json`
 
-### 增量收益平均值
-
-| 语言 | 增量收益平均值 |
+### 澧為噺鏀剁泭骞冲潎鍊?
+| 璇█ | 澧為噺鏀剁泭骞冲潎鍊?|
 |---|---:|
 | Sengoo | 95.99% |
 | C++ | -2.28% |
 | Rust | -4.95% |
 | Python | 2.61% |
 
-### 10k-1000k e2e 编译对比
+### 10k-1000k e2e 缂栬瘧瀵规瘮
 
 | LOC | Sengoo (ms) | C++ (ms) | Rust (ms) | Python (ms) |
 |---|---:|---:|---:|---:|
@@ -272,36 +281,32 @@ python ./scripts/interop-bootstrap-gate.py --mode soft --interop-sample ./result
 | 100k | 417.53 | 1074.84 | 6625.35 | 832.91 |
 | 1000k | 1827.84 | 4883.70 | 54642.47 | 8283.46 |
 
-### 编译峰值 RSS（仅编译阶段）
-
+### 缂栬瘧宄板€?RSS锛堜粎缂栬瘧闃舵锛?
 | LOC | Sengoo (MB) | C++ (MB) | Rust (MB) | Python (MB) |
 |---|---:|---:|---:|---:|
 | 10k | 18.88 | 75.68 | 70.84 | 41.40 |
 | 100k | 140.18 | 118.50 | 337.86 | 288.46 |
 | 1000k | 1367.99 | 435.22 | 2681.55 | 2610.90 |
 
-### 低内存模式（新增：1000k e2e）
-
-| 模式 | e2e 平均 (ms) | 峰值 RSS (MB) |
+### 浣庡唴瀛樻ā寮忥紙鏂板锛?000k e2e锛?
+| 妯″紡 | e2e 骞冲潎 (ms) | 宄板€?RSS (MB) |
 |---|---:|---:|
-| 默认（`sgc build`） | 2331.39 | 1418.61 |
+| 榛樿锛坄sgc build`锛?| 2331.39 | 1418.61 |
 | `--low-memory` | 1737.71 | 672.10 |
 
-优势：
+浼樺娍锛?
+- e2e 鏃堕棿涓嬮檷 25.46%
+- 宄板€?RSS 涓嬮檷 52.62%
 
-- e2e 时间下降 25.46%
-- 峰值 RSS 下降 52.62%
+鍓綔鐢細
 
-副作用：
+- 澧為噺缂撳瓨/浼氳瘽澶嶇敤鑳藉姏浼氬噺寮?- 鍓嶇鍥哄畾鍗曠嚎绋?- MIR 浼樺寲涓婇檺涓嬮檷
 
-- 增量缓存/会话复用能力会减弱
-- 前端固定单线程
-- MIR 优化上限下降
-
-开启方式：
+寮€鍚柟寮忥細
 
 ```bash
 sgc build your_file.sg --low-memory
 sgc run your_file.sg --low-memory
 ```
+
 

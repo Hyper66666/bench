@@ -5,6 +5,7 @@ results/*.env
 .scenario-matrix-work/
 .advanced-work/
 .interop-work/
+.llm-scheduler-work/
 tmp-workset-recover/
 results/.tmp/
 
